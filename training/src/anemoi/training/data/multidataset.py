@@ -129,16 +129,34 @@ class MultiDataset(IterableDataset):
 
     @cached_property
     def valid_date_indices(self) -> np.ndarray:
-        """Return valid date indices from all datasets."""
+        """Return overlapping valid date indices from all datasets."""
         valid_date_indices = self._collect("valid_date_indices")
-        reference_indices = None
+        overlapping_indices = None
+        
         for name, indices in valid_date_indices.items():
-            if reference_indices is None:
-                reference_indices = indices
-            assert all(
-                indices == reference_indices,
-            ), f"Dataset '{name}' has different valid_date_indices than other datasets"
-        return reference_indices
+            LOGGER.info("Dataset '%s' has %d valid date indices", name, len(indices))
+            if overlapping_indices is None:
+                overlapping_indices = indices
+            else:
+                # Find intersection of indices
+                overlapping_indices = np.intersect1d(overlapping_indices, indices)
+                LOGGER.info(
+                    "After intersecting with dataset '%s', %d overlapping indices remain",
+                    name,
+                    len(overlapping_indices),
+                )
+        
+        if len(overlapping_indices) == 0:
+            msg = "No overlapping valid date indices found across all datasets"
+            raise ValueError(msg)
+        
+        LOGGER.info(
+            "Found %d overlapping valid date indices across all %d datasets",
+            len(overlapping_indices),
+            len(self.datasets),
+        )
+        
+        return overlapping_indices
 
     @property
     def data(self) -> dict:
@@ -154,22 +172,47 @@ class MultiDataset(IterableDataset):
         self._apply_to_all_datasets("set_ens_comm_group_info", *args, **kwargs)
 
     def per_worker_init(self, n_workers: int, worker_id: int) -> None:
-        """Initialize all datasets for this worker."""
+        """Initialize all datasets for this worker.
+        
+        Updates chunk_index_range based on the overlapping valid_date_indices.
+        """
         self.worker_id = worker_id
         self._apply_to_all_datasets("per_worker_init", n_workers, worker_id)
-        base_seed = get_base_seed()
+        
+        # Get communication group info from primary dataset
+        self.sample_comm_num_groups = self.primary_dataset.sample_comm_num_groups
+        self.sample_comm_group_id = self.primary_dataset.sample_comm_group_id
+        self.global_rank = self.primary_dataset.global_rank
+        self.model_comm_group_id = self.primary_dataset.model_comm_group_id
+        
+        # Calculate chunk_index_range based on the overlapping valid_date_indices, overwriting the 
+        # original chunk_index_range which only considered the primary dataset
+        shard_size = len(self.valid_date_indices) // self.sample_comm_num_groups
+        shard_start = self.sample_comm_group_id * shard_size
+        shard_end = (self.sample_comm_group_id + 1) * shard_size
 
+        shard_len = shard_end - shard_start
+        self.n_samples_per_worker = shard_len // n_workers
+
+        low = shard_start + worker_id * self.n_samples_per_worker
+        high = min(shard_start + (worker_id + 1) * self.n_samples_per_worker, shard_end)
+        self.chunk_index_range = np.arange(low, high, dtype=np.uint32)
+        
+        # Initialize RNG
+        base_seed = get_base_seed()
         torch.manual_seed(base_seed)
         random.seed(base_seed)
         self.rng = np.random.default_rng(seed=base_seed)
         sanity_rnd = self.rng.random(1)
         LOGGER.info(
-            ("Worker %d (%s, pid %d, base_seed %d, sanity rnd %f)"),
+            "MultiDataset Worker %d (pid %d, global_rank %d, sanity_rnd %f) has chunk range [%d:%d] for %d overlapping indices",
             worker_id,
-            self.label,
             os.getpid(),
-            base_seed,
+            self.global_rank,
             sanity_rnd,
+            low,
+            high,
+            len(self.valid_date_indices),
         )
 
     def get_sample(self, index: int) -> dict[str, torch.Tensor]:
@@ -184,18 +227,14 @@ class MultiDataset(IterableDataset):
             Dictionary mapping dataset names to their tensor samples
             Format: {"dataset_a": tensor_a, "dataset_b": tensor_b, ...}
         """
-        # Get the shuffled indices from the primary dataset
-        # All datasets will use the same shuffled indices for synchronization
-        chunk_index_range = self.primary_dataset.chunk_index_range
-
         if self.shuffle:
             shuffled_chunk_indices = self.rng.choice(
                 self.valid_date_indices,
                 size=len(self.valid_date_indices),
                 replace=False,
-            )[chunk_index_range]
+            )[self.chunk_index_range]
         else:
-            shuffled_chunk_indices = self.valid_date_indices[chunk_index_range]
+            shuffled_chunk_indices = self.valid_date_indices[self.chunk_index_range]
 
         LOGGER.debug(
             "%s worker pid %d, worker id %d, using synchronized indices[0:10]: %s",
