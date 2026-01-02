@@ -157,6 +157,8 @@ class UnvalidatedBaseSchema(SchemaCommonMixin, PydanticBaseModel):
 
 
 def convert_to_omegaconf(config: BaseSchema) -> dict:
+    if isinstance(config, DictConfig):
+        return config
     config = config.model_dump(by_alias=True)
     return OmegaConf.create(config)
 
