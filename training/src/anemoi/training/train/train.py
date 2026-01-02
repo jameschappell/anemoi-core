@@ -24,6 +24,7 @@ from hydra.utils import get_class
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
+from packaging import version
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from torch_geometric.data import HeteroData
 
@@ -36,14 +37,16 @@ from anemoi.training.diagnostics.logger import get_wandb_logger
 from anemoi.training.schemas.base_schema import BaseSchema
 from anemoi.training.schemas.base_schema import UnvalidatedBaseSchema
 from anemoi.training.schemas.base_schema import convert_to_omegaconf
-from anemoi.training.train.tasks.base import get_multiple_datasets_config
 from anemoi.training.utils.checkpoint import freeze_submodule_by_name
 from anemoi.training.utils.checkpoint import transfer_learning_loading
+from anemoi.training.utils.config_utils import get_multiple_datasets_config
 from anemoi.training.utils.jsonify import map_config_to_primitives
 from anemoi.training.utils.seeding import get_base_seed
 from anemoi.utils.provenance import gather_provenance_info
 
 LOGGER = logging.getLogger(__name__)
+
+PL_VERSION = version.parse(pl.__version__)
 
 
 class AnemoiTrainer(ABC):
@@ -183,7 +186,7 @@ class AnemoiTrainer(ABC):
         dataset_configs = get_multiple_datasets_config(self.config.dataloader.training)
         for dataset_name, dataset_config in dataset_configs.items():
             LOGGER.info("Creating graph for dataset '%s'", dataset_name)
-            graphs[dataset_name] = self._create_graph_for_dataset(dataset_config, dataset_name)
+            graphs[dataset_name] = self._create_graph_for_dataset(dataset_config.dataset, dataset_name)
         return graphs
 
     @cached_property
@@ -206,7 +209,7 @@ class AnemoiTrainer(ABC):
         "Please use a different activation function."
 
         kwargs = {
-            "config": self.config,
+            "config": convert_to_omegaconf(self.config),
             "data_indices": self.data_indices,
             "graph_data": self.graph_data,
             "metadata": self.metadata,
@@ -229,14 +232,17 @@ class AnemoiTrainer(ABC):
                 # pop data_indices so that the data indices on the checkpoint do not get overwritten
                 # by the data indices from the new config
                 kwargs.pop("data_indices")
-                model = model_task.load_from_checkpoint(self.last_checkpoint, **kwargs, strict=False)
+                model = model_task.load_from_checkpoint(
+                    self.last_checkpoint,
+                    **kwargs,
+                    strict=False,
+                    weights_only=False,  # required for Pytorch Lightning 2.6
+                )
 
             model.data_indices = self.data_indices
             # check data indices in original checkpoint and current data indices are the same
-            self.data_indices.compare_variables(
-                model._ckpt_model_name_to_index,
-                self.data_indices.name_to_index,
-            )  # TODO for multi dataset
+            for data_indices in self.data_indices.values():
+                data_indices.compare_variables(model._ckpt_model_name_to_index, data_indices.name_to_index)
 
         if hasattr(self.config.training, "submodules_to_freeze"):
             # Freeze the chosen model weights
@@ -293,11 +299,15 @@ class AnemoiTrainer(ABC):
 
     def _get_warm_start_checkpoint(self) -> Path | None:
         """Returns the warm start checkpoint path if specified."""
-        warm_start_path = self.config.system.input.warm_start
+        raw_path = self.config.system.input.warm_start
+        if not raw_path:
+            return None
 
-        if warm_start_path:
+        warm_start_path = Path(raw_path)
+
+        if not warm_start_path.is_file():
             msg = f"Warm start checkpoint not found: {warm_start_path}"
-            assert Path.is_file(warm_start_path), msg
+            raise FileNotFoundError(msg)
         return warm_start_path
 
     def _get_checkpoint_directory(self, fork_id: str) -> Path:
@@ -330,18 +340,33 @@ class AnemoiTrainer(ABC):
     @cached_property
     def metadata(self) -> dict:
         """Metadata and provenance information."""
-        return map_config_to_primitives(
-            {
-                "version": "2.0",
-                "config": convert_to_omegaconf(self.config),
-                "seed": self.initial_seed,
-                "run_id": self.run_id,
-                "dataset": self.datamodule.metadata,
-                "data_indices": self.datamodule.data_indices,
-                "provenance_training": gather_provenance_info(),
-                "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
-            },
-        )
+        metadata_inference = {
+            "seed": self.initial_seed,
+            "run_id": self.run_id,
+            "dataset_names": None,  # will be populated in DataModule
+            "task": None,  # will be populated in BaseGraphModule
+        }
+        # Store metadata needed in inference in a separate dict "metadata_inference"
+        # For each group, we add a dictionary with:
+        # - data_indices, containing name_to_index mappings
+        # - variable_types, specifyting forcing/diagnostics/prognostic/target splits
+        # - shapes, specifying the shape of the input tensor (for dimensions where the size is fixed)
+        # - timesteps, specifying the time steps used during training for input and output
+
+        md_dict = {
+            "version": "2.0",
+            "config": convert_to_omegaconf(self.config),
+            "seed": self.initial_seed,
+            "run_id": self.run_id,
+            "dataset": None,  # will be populated in DataModule
+            "data_indices": None,  # will be populated in DataModule
+            "provenance_training": gather_provenance_info(),
+            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
+            "metadata_inference": metadata_inference,
+            "uuid": None,  # will be populated in checkpoint callback
+        }
+        self.datamodule.fill_metadata(md_dict)
+        return map_config_to_primitives(md_dict)
 
     @cached_property
     def supporting_arrays(self) -> dict:
@@ -461,7 +486,7 @@ class AnemoiTrainer(ABC):
         if self.config.diagnostics.log.mlflow.enabled:
             # Check if the run ID is dry - e.g. without a checkpoint
             self.dry_run = (
-                self.mlflow_logger._parent_dry_run and not Path(self.config.system.output.checkpoints).is_dir()
+                self.mlflow_logger._parent_dry_run and not Path(self.config.system.output.checkpoints.root).is_dir()
             )
             self.start_from_checkpoint = (
                 False if (self.dry_run and not bool(self.config.training.fork_run_id)) else self.start_from_checkpoint
@@ -469,6 +494,7 @@ class AnemoiTrainer(ABC):
             LOGGER.info("Dry run: %s", self.dry_run)
 
     def prepare_compilation(self) -> None:
+
         if hasattr(self.config.model, "compile"):
             self.model = mark_for_compilation(self.model, self.config.model_dump(by_alias=True).model.compile)
         if hasattr(self.config.training, "recompile_limit"):
@@ -482,6 +508,28 @@ class AnemoiTrainer(ABC):
             convert_to_omegaconf(self.config).training.strategy,
             static_graph=not self.config.training.accum_grad_batches > 1,
         )
+
+    @cached_property
+    def fit_parameters(self) -> Any:
+        """Options to be passed to trainer.fit().
+
+        This builds up different arguments based on the version of pytorch lightning.
+        From 2.6 onwards pytorch-lightning has now exposed the weights_only flag to be
+        consistent with Pytorch's behaviour.
+        Refer to https://docs.pytorch.org/docs/stable/generated/torch.load.html for more details.
+        `weights_only` does not refer to loading the optimizer. Pytorch_lightning controls this
+        via the checkpoint connector. If a ckpt_path is passed then all states are loaded. If no ckpt_path
+        is passed and just the `load_from_checkpoint` interface is used - then optimizer states are skipped.
+        """
+        params = {}
+
+        params["model"] = self.model
+        params["datamodule"] = self.datamodule
+        params["ckpt_path"] = None if (self.load_weights_only) else self.last_checkpoint
+
+        if version.parse("2.6.0") <= PL_VERSION:
+            params["weights_only"] = False
+        return params
 
     def train(self) -> None:
         """Training entry point."""
@@ -518,11 +566,7 @@ class AnemoiTrainer(ABC):
 
         LOGGER.debug("Starting training..")
 
-        trainer.fit(
-            self.model,
-            datamodule=self.datamodule,
-            ckpt_path=None if (self.load_weights_only) else self.last_checkpoint,
-        )
+        trainer.fit(**self.fit_parameters)
 
         if self.config.diagnostics.print_memory_summary:
             LOGGER.info("memory summary: %s", torch.cuda.memory_summary(device=0))

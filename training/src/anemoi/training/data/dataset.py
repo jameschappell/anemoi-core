@@ -8,19 +8,17 @@
 # nor does it submit to any jurisdiction.
 
 
+import datetime
 import logging
-import os
 from collections.abc import Callable
 from functools import cached_property
 
-import numpy as np
 import torch
 from einops import rearrange
 from rich.console import Console
 from rich.tree import Tree
 
 from anemoi.training.data.grid_indices import BaseGridIndices
-from anemoi.training.utils.usable_indices import get_usable_indices
 
 LOGGER = logging.getLogger(__name__)
 
@@ -32,10 +30,7 @@ class NativeGridDataset:
         self,
         data_reader: Callable,
         grid_indices: type[BaseGridIndices],
-        relative_date_indices: list,
         timestep: str = "6h",
-        shuffle: bool = True,
-        label: str = "generic",
     ) -> None:
         """Initialize (part of) the dataset state.
 
@@ -45,45 +40,14 @@ class NativeGridDataset:
             user function that opens and returns the anemoi-datasets array data
         grid_indices : Type[BaseGridIndices]
             indices of the grid to keep. Defaults to None, which keeps all spatial indices.
-        relative_date_indices: list
-            list of time indices to load from the data relative to the current sample i in __iter__
         timestep : int, optional
             the time frequency of the samples, by default '6h'
-        shuffle : bool, optional
-            Shuffle batches, by default True
         label : str, optional
             label for the dataset, by default "generic"
         """
-        self.label = label
-
         self.data = data_reader
-
         self.timestep = timestep
         self.grid_indices = grid_indices
-
-        # lazy init model and reader group info, will be set by the DDPGroupStrategy:
-        self.model_comm_group_rank = 0
-        self.model_comm_num_groups = 1
-        self.model_comm_group_id = 0
-        self.global_rank = 0
-
-        self.reader_group_rank = 0
-        self.reader_group_size = 1
-
-        self.sample_comm_num_groups = 1  # groups that work on the same sample / batch
-        self.sample_comm_group_id = 0
-
-        self.ens_comm_group_rank = 0
-        self.ens_comm_num_groups = 1
-        self.ens_comm_group_id = 0
-
-        # additional state vars (lazy init)
-        self.n_samples_per_worker = 0
-        self.chunk_index_range: np.ndarray | None = None
-        self.shuffle = shuffle
-
-        # relative index of dates to extract
-        self.relative_date_indices = relative_date_indices
 
     @cached_property
     def statistics(self) -> dict:
@@ -99,9 +63,19 @@ class NativeGridDataset:
             return None
 
     @cached_property
+    def variables(self) -> list[str]:
+        """Return dataset variables."""
+        return self.data.variables
+
+    @cached_property
     def metadata(self) -> dict:
         """Return dataset metadata."""
         return self.data.metadata()
+
+    @cached_property
+    def frequency(self) -> datetime.timedelta:
+        """Return dataset frequency."""
+        return self.data.frequency
 
     @cached_property
     def supporting_arrays(self) -> dict:
@@ -118,151 +92,22 @@ class NativeGridDataset:
         """Return dataset resolution."""
         return self.data.resolution
 
-    @cached_property
-    def valid_date_indices(self) -> np.ndarray:
-        """Return valid date indices.
-
-        A date t is valid if we can sample the elements t + i
-        for every relative_date_index i.
-        """
-        return get_usable_indices(
-            self.data.missing,
-            len(self.data),
-            np.array(self.relative_date_indices, dtype=np.int64),
-            self.data.trajectory_ids,
-        )
-
-    def set_comm_group_info(
-        self,
-        global_rank: int,
-        model_comm_group_id: int,
-        model_comm_group_rank: int,
-        model_comm_num_groups: int,
-        reader_group_rank: int,
-        reader_group_size: int,
-    ) -> None:
-        """Set model and reader communication group information (called by DDPGroupStrategy).
-
-        Parameters
-        ----------
-        global_rank : int
-            Global rank
-        model_comm_group_id : int
-            Model communication group ID
-        model_comm_group_rank : int
-            Model communication group rank
-        model_comm_num_groups : int
-            Number of model communication groups
-        reader_group_rank : int
-            Reader group rank
-        reader_group_size : int
-            Reader group size
-        """
-        self.global_rank = global_rank
-        self.model_comm_group_id = model_comm_group_id
-        self.model_comm_group_rank = model_comm_group_rank
-        self.model_comm_num_groups = model_comm_num_groups
-        self.reader_group_rank = reader_group_rank
-        self.reader_group_size = reader_group_size
-
-        self.sample_comm_group_id = model_comm_group_id
-        self.sample_comm_num_groups = model_comm_num_groups
-
-        assert self.reader_group_size >= 1, f"reader_group_size(={self.reader_group_size}) must be positive"
-
-        LOGGER.info(
-            "NativeGridDataset.set_group_info(): global_rank %d, model_comm_group_id %d, "
-            "model_comm_group_rank %d, model_comm_num_groups %d, reader_group_rank %d",
-            global_rank,
-            model_comm_group_id,
-            model_comm_group_rank,
-            model_comm_num_groups,
-            reader_group_rank,
-        )
-
-    def set_ens_comm_group_info(
-        self,
-        ens_comm_group_id: int,
-        ens_comm_group_rank: int,
-        ens_comm_num_groups: int,
-    ) -> None:
-        """Set ensemble communication group information (called by DDPGroupStrategy).
-
-        Parameters
-        ----------
-        ens_comm_group_id : int
-            Ensemble communication group ID
-        ens_comm_group_rank : int
-            Ensemble communication group rank
-        ens_comm_num_groups : int
-            Number of ensemble communication groups
-        """
-        self.ens_comm_group_id = ens_comm_group_id
-        self.ens_comm_group_rank = ens_comm_group_rank
-        self.ens_comm_num_groups = ens_comm_num_groups
-
-        LOGGER.info(
-            "NativeGridDataset.set_group_info(): global_rank %d, ens_comm_group_id %d, "
-            "ens_comm_group_rank %d, ens_comm_num_groups %d, reader_group_rank %d",
-            self.global_rank,
-            ens_comm_group_id,
-            ens_comm_group_rank,
-            ens_comm_num_groups,
-            self.reader_group_rank,
-        )
-
-    def per_worker_init(self, n_workers: int, worker_id: int) -> None:
-        """Called by worker_init_func on each copy of dataset.
-
-        This initialises after the worker process has been spawned.
-
-        Parameters
-        ----------
-        n_workers : int
-            Number of workers
-        worker_id : int
-            Worker ID
-        """
-        # Divide this equally across shards (one shard per group!)
-        shard_size = len(self.valid_date_indices) // self.sample_comm_num_groups
-        shard_start = self.sample_comm_group_id * shard_size
-        shard_end = (self.sample_comm_group_id + 1) * shard_size
-
-        shard_len = shard_end - shard_start
-        self.n_samples_per_worker = shard_len // n_workers
-
-        low = shard_start + worker_id * self.n_samples_per_worker
-        high = min(shard_start + (worker_id + 1) * self.n_samples_per_worker, shard_end)
-        self.chunk_index_range = np.arange(low, high, dtype=np.uint32)
-
-        LOGGER.info(
-            "Worker %d (pid %d, global_rank %d, model comm group %d)  has low/high range %d / %d",
-            worker_id,
-            os.getpid(),
-            self.global_rank,
-            self.model_comm_group_id,
-            low,
-            high,
-        )
-
-    def get_sample(self, index: int) -> torch.Tensor:
-        start = index + self.relative_date_indices[0]
-        end = index + self.relative_date_indices[-1] + 1
-        timeincrement = self.relative_date_indices[1] - self.relative_date_indices[0]
+    def get_sample(self, time_indices: int | list[int] | slice, reader_group_rank: int) -> torch.Tensor:
         # NOTE: this is temporary until anemoi datasets allows indexing with arrays or lists
         # data[start...] will be replaced with data[self.relative_date_indices + i]
 
-        grid_shard_indices = self.grid_indices.get_shard_indices(self.reader_group_rank)
+        grid_shard_indices = self.grid_indices.get_shard_indices(reader_group_rank)
         if isinstance(grid_shard_indices, slice):
             # Load only shards into CPU memory
-            x = self.data[start:end:timeincrement, :, :, grid_shard_indices]
+            x = self.data[time_indices, :, :, grid_shard_indices]
 
         else:
             # Load full grid in CPU memory, select grid_shard after
             # Note that anemoi-datasets currently doesn't support slicing + indexing
             # in the same operation.
-            x = self.data[start:end:timeincrement, :, :, :]
+            x = self.data[time_indices, :, :, :]
             x = x[..., grid_shard_indices]  # select the grid shard
+
         x = rearrange(x, "dates variables ensemble gridpoints -> dates ensemble gridpoints variables")
 
         return torch.from_numpy(x)
@@ -278,7 +123,5 @@ class NativeGridDataset:
         tree.add(f"Dataset: {self.data}")
         tree.add(f"Timestep: {self.timestep}")
         tree.add(f"Resolution: {self.resolution}")
-        tree.add(f"Relative dates: {self.relative_date_indices}")
         tree.add(f"Num variables: {len(self.name_to_index)}")
-        tree.add(f"Num samples: {len(self.valid_date_indices)}")
         return tree

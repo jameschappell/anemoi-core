@@ -7,7 +7,6 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
-
 import logging
 import sys
 from abc import ABC
@@ -19,6 +18,8 @@ from anemoi.models.interface import AnemoiModelInterface
 from anemoi.training.losses.scaler_tensor import TENSOR_SPEC
 from anemoi.training.utils.enums import TensorDim
 
+LOGGER = logging.getLogger(__name__)
+
 if sys.version_info < (3, 11):
     from enum import Enum
 
@@ -27,8 +28,6 @@ if sys.version_info < (3, 11):
 
 else:
     from enum import StrEnum
-
-LOGGER = logging.getLogger(__name__)
 
 
 class BaseScaler(ABC):

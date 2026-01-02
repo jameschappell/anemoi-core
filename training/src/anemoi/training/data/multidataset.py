@@ -7,6 +7,7 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+import datetime
 import logging
 import os
 import random
@@ -20,6 +21,8 @@ from torch.utils.data import IterableDataset
 
 from anemoi.training.data.dataset import NativeGridDataset
 from anemoi.training.utils.seeding import get_base_seed
+from anemoi.training.utils.usable_indices import get_usable_indices
+from anemoi.utils.dates import frequency_to_seconds
 
 LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +60,7 @@ class MultiDataset(IterableDataset):
         """
         self.label = label
         self.shuffle = shuffle
+        self.timestep = timestep
         self.dataset_names = list(data_readers.keys())
 
         # Create individual NativeGridDataset for each dataset with its own grid_indices
@@ -69,14 +73,15 @@ class MultiDataset(IterableDataset):
             self.datasets[name] = NativeGridDataset(
                 data_reader=data_reader,
                 grid_indices=grid_indices[name],
-                relative_date_indices=relative_date_indices,
                 timestep=timestep,
-                shuffle=self.shuffle,  # Will be overridden in __iter__
-                label=f"{label}_{name}",
             )
 
-        # Use the first dataset as the primary for shared properties
-        self.primary_dataset = next(iter(self.datasets.values()))
+        # relative_date_indices are computed in terms of data frequency
+        # data_relative_date_indices are in terms of the specific dataset
+        self.data_relative_date_indices = np.array(
+            [self.timeincrement * idx for idx in relative_date_indices],
+            dtype=np.int64,
+        )
 
         LOGGER.info(
             "MultiDataset initialized with %d datasets (%s), %d valid indices each",
@@ -84,6 +89,26 @@ class MultiDataset(IterableDataset):
             ", ".join(self.dataset_names),
             len(self.valid_date_indices),
         )
+
+        # lazy init model and reader group info, will be set by the DDPGroupStrategy:
+        self.model_comm_group_rank = 0
+        self.model_comm_num_groups = 1
+        self.model_comm_group_id = 0
+        self.global_rank = 0
+
+        self.reader_group_rank = 0
+        self.reader_group_size = 1
+
+        self.sample_comm_num_groups = 1  # groups that work on the same sample / batch
+        self.sample_comm_group_id = 0
+
+        self.ens_comm_group_rank = 0
+        self.ens_comm_num_groups = 1
+        self.ens_comm_group_id = 0
+
+        # additional state vars (lazy init)
+        self.n_samples_per_worker = 0
+        self.chunk_index_range: np.ndarray | None = None
 
     def _collect(self, attr_name: str) -> dict:
         """Helper method to collect attributes from all datasets."""
@@ -118,6 +143,16 @@ class MultiDataset(IterableDataset):
         return self._collect("supporting_arrays")
 
     @cached_property
+    def variables(self) -> dict[str, list[str]]:
+        """Return combined variables from all datasets."""
+        return self._collect("variables")
+
+    @property
+    def data(self) -> dict:
+        """Return data from all datasets as dictionary."""
+        return self._collect("data")
+
+    @cached_property
     def name_to_index(self) -> dict[str, dict]:
         """Return combined name_to_index mapping from all datasets."""
         return self._collect("name_to_index")
@@ -128,48 +163,153 @@ class MultiDataset(IterableDataset):
         return self._collect("resolution")
 
     @cached_property
-    def valid_date_indices(self) -> np.ndarray:
-        """Return overlapping valid date indices from all datasets."""
-        valid_date_indices = self._collect("valid_date_indices")
-        overlapping_indices = None
-        
-        for name, indices in valid_date_indices.items():
-            LOGGER.info("Dataset '%s' has %d valid date indices", name, len(indices))
-            if overlapping_indices is None:
-                overlapping_indices = indices
-            else:
-                # Find intersection of indices
-                overlapping_indices = np.intersect1d(overlapping_indices, indices)
-                LOGGER.info(
-                    "After intersecting with dataset '%s', %d overlapping indices remain",
-                    name,
-                    len(overlapping_indices),
-                )
-        
-        if len(overlapping_indices) == 0:
-            msg = "No overlapping valid date indices found across all datasets"
-            raise ValueError(msg)
-        
-        LOGGER.info(
-            "Found %d overlapping valid date indices across all %d datasets",
-            len(overlapping_indices),
-            len(self.datasets),
+    def frequency(self) -> datetime.timedelta:
+        """Return combined frequency from all datasets."""
+        freqs = self._collect("frequency")
+        freq_ref = None
+        for name, freq in freqs.items():
+            if freq_ref is None:
+                freq_ref = freq
+            assert freq == freq_ref, f"Dataset '{name}' has different frequency than other datasets"
+        return freq_ref
+
+    @cached_property
+    def timeincrement(self) -> int:
+        try:
+            frequency = frequency_to_seconds(self.frequency)
+        except ValueError as e:
+            msg = f"Error in data frequency, {self.frequency}"
+            raise ValueError(msg) from e
+
+        try:
+            timestep = frequency_to_seconds(self.timestep)
+        except ValueError as e:
+            msg = f"Error in timestep, {self.timestep}"
+            raise ValueError(msg) from e
+
+        assert timestep % frequency == 0, (
+            f"Timestep ({self.timestep} == {timestep}) isn't a "
+            f"multiple of data frequency ({self.frequency} == {frequency})."
         )
-        
-        return overlapping_indices
 
-    @property
-    def data(self) -> dict:
-        """Return data from all datasets as dictionary."""
-        return self._collect("data")
+        LOGGER.info(
+            "Timeincrement set to %s for data with frequency, %s, and timestep, %s",
+            timestep // frequency,
+            frequency,
+            timestep,
+        )
+        return timestep // frequency
 
-    def set_comm_group_info(self, *args, **kwargs) -> None:
-        """Set communication group information for all datasets."""
-        self._apply_to_all_datasets("set_comm_group_info", *args, **kwargs)
+    @cached_property
+    def valid_date_indices(self) -> np.ndarray:
+        """Return valid date indices.
 
-    def set_ens_comm_group_info(self, *args, **kwargs) -> None:
-        """Set ensemble communication group information for all datasets."""
-        self._apply_to_all_datasets("set_ens_comm_group_info", *args, **kwargs)
+        A date t is valid if we can sample the elements t + i
+        for every relative_date_index i.
+        """
+        valid_date_indices_ref = None
+        for ds in self.datasets.values():
+            valid_date_indices = get_usable_indices(
+                ds.data.missing,
+                len(ds.data),
+                self.data_relative_date_indices,
+                ds.data.trajectory_ids,
+            )
+            if valid_date_indices_ref is None:
+                valid_date_indices_ref = valid_date_indices
+            assert np.array_equal(
+                valid_date_indices_ref,
+                valid_date_indices,
+            ), "Datasets have different valid_date_indices, cannot synchronize samples"
+        return valid_date_indices_ref
+
+    def set_comm_group_info(
+        self,
+        global_rank: int,
+        model_comm_group_id: int,
+        model_comm_group_rank: int,
+        model_comm_num_groups: int,
+        reader_group_rank: int,
+        reader_group_size: int,
+    ) -> None:
+        """Set model and reader communication group information (called by DDPGroupStrategy).
+
+        Parameters
+        ----------
+        global_rank : int
+            Global rank
+        model_comm_group_id : int
+            Model communication group ID
+        model_comm_group_rank : int
+            Model communication group rank
+        model_comm_num_groups : int
+            Number of model communication groups
+        reader_group_rank : int
+            Reader group rank
+        reader_group_size : int
+            Reader group size
+        """
+        self.global_rank = global_rank
+        self.model_comm_group_id = model_comm_group_id
+        self.model_comm_group_rank = model_comm_group_rank
+        self.model_comm_num_groups = model_comm_num_groups
+        self.reader_group_rank = reader_group_rank
+        self.reader_group_size = reader_group_size
+
+        self.sample_comm_group_id = model_comm_group_id
+        self.sample_comm_num_groups = model_comm_num_groups
+
+        assert self.reader_group_size >= 1, f"reader_group_size(={self.reader_group_size}) must be positive"
+
+        LOGGER.info(
+            "NativeGridDataset.set_group_info(): global_rank %d, model_comm_group_id %d, "
+            "model_comm_group_rank %d, model_comm_num_groups %d, reader_group_rank %d, "
+            "sample_comm_group_id %d, sample_comm_num_groups %d",
+            global_rank,
+            model_comm_group_id,
+            model_comm_group_rank,
+            model_comm_num_groups,
+            reader_group_rank,
+            self.sample_comm_group_id,
+            self.sample_comm_num_groups,
+        )
+
+    def set_ens_comm_group_info(
+        self,
+        ens_comm_group_id: int,
+        ens_comm_group_rank: int,
+        ens_comm_num_groups: int,
+    ) -> None:
+        """Set ensemble communication group information (called by DDPGroupStrategy).
+
+        Parameters
+        ----------
+        ens_comm_group_id : int
+            Ensemble communication group ID
+        ens_comm_group_rank : int
+            Ensemble communication group rank
+        ens_comm_num_groups : int
+            Number of ensemble communication groups
+        """
+        self.ens_comm_group_id = ens_comm_group_id
+        self.ens_comm_group_rank = ens_comm_group_rank
+        self.ens_comm_num_groups = ens_comm_num_groups
+
+        self.sample_comm_group_id = ens_comm_group_id
+        self.sample_comm_num_groups = ens_comm_num_groups
+
+        LOGGER.info(
+            "NativeGridDataset.set_ens_comm_group_info(): global_rank %d, ens_comm_group_id %d, "
+            "ens_comm_group_rank %d, ens_comm_num_groups %d, reader_group_rank %d, "
+            "sample_comm_group_id %d, sample_comm_num_groups %d",
+            self.global_rank,
+            ens_comm_group_id,
+            ens_comm_group_rank,
+            ens_comm_num_groups,
+            self.reader_group_rank,
+            self.sample_comm_group_id,
+            self.sample_comm_num_groups,
+        )
 
     def per_worker_init(self, n_workers: int, worker_id: int) -> None:
         """Initialize all datasets for this worker.
@@ -177,16 +317,8 @@ class MultiDataset(IterableDataset):
         Updates chunk_index_range based on the overlapping valid_date_indices.
         """
         self.worker_id = worker_id
-        self._apply_to_all_datasets("per_worker_init", n_workers, worker_id)
-        
-        # Get communication group info from primary dataset
-        self.sample_comm_num_groups = self.primary_dataset.sample_comm_num_groups
-        self.sample_comm_group_id = self.primary_dataset.sample_comm_group_id
-        self.global_rank = self.primary_dataset.global_rank
-        self.model_comm_group_id = self.primary_dataset.model_comm_group_id
-        
-        # Calculate chunk_index_range based on the overlapping valid_date_indices, overwriting the 
-        # original chunk_index_range which only considered the primary dataset
+
+        # Divide this equally across shards (one shard per group!)
         shard_size = len(self.valid_date_indices) // self.sample_comm_num_groups
         shard_start = self.sample_comm_group_id * shard_size
         shard_end = (self.sample_comm_group_id + 1) * shard_size
@@ -197,8 +329,17 @@ class MultiDataset(IterableDataset):
         low = shard_start + worker_id * self.n_samples_per_worker
         high = min(shard_start + (worker_id + 1) * self.n_samples_per_worker, shard_end)
         self.chunk_index_range = np.arange(low, high, dtype=np.uint32)
-        
-        # Initialize RNG
+
+        LOGGER.info(
+            "Worker %d (pid %d, global_rank %d, model comm group %d)  has low/high range %d / %d",
+            worker_id,
+            os.getpid(),
+            self.global_rank,
+            self.model_comm_group_id,
+            low,
+            high,
+        )
+
         base_seed = get_base_seed()
         torch.manual_seed(base_seed)
         random.seed(base_seed)
@@ -216,7 +357,11 @@ class MultiDataset(IterableDataset):
         )
 
     def get_sample(self, index: int) -> dict[str, torch.Tensor]:
-        return {name: dataset.get_sample(index) for name, dataset in self.datasets.items()}
+        start = index + self.data_relative_date_indices[0]
+        end = index + self.data_relative_date_indices[-1] + 1
+        timeincrement = self.data_relative_date_indices[1] - self.data_relative_date_indices[0]
+        time_steps = slice(start, end, timeincrement)
+        return {name: dataset.get_sample(time_steps, self.reader_group_rank) for name, dataset in self.datasets.items()}
 
     def __iter__(self) -> dict[str, torch.Tensor]:
         """Return an iterator that yields dictionaries of synchronized samples.
@@ -227,6 +372,8 @@ class MultiDataset(IterableDataset):
             Dictionary mapping dataset names to their tensor samples
             Format: {"dataset_a": tensor_a, "dataset_b": tensor_b, ...}
         """
+        # Get the shuffled indices from the primary dataset
+        # All datasets will use the same shuffled indices for synchronization
         if self.shuffle:
             shuffled_chunk_indices = self.rng.choice(
                 self.valid_date_indices,
@@ -243,7 +390,7 @@ class MultiDataset(IterableDataset):
             self.worker_id,
             shuffled_chunk_indices[:10],
         )
-        # TODO: improve this...
+        # TODO(): improve this...
         for i in shuffled_chunk_indices:
             yield self.get_sample(i)
 
