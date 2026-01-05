@@ -146,9 +146,6 @@ class BaseGraphModel(nn.Module):
             reference_dataset = dataset_names[0]
             reference_graph = self._graph_data[reference_dataset]
             reference_hidden_graph = reference_graph[(self._graph_name_hidden, "to", self._graph_name_hidden)]
-            
-            LOGGER.info(f"{reference_graph=}")
-            LOGGER.info(f"{reference_hidden_graph=}")
 
             # Check hidden graph structure consistency across all datasets
             for dataset_name in dataset_names[1:]:
