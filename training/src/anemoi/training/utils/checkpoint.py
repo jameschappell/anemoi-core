@@ -14,6 +14,7 @@ import logging
 import pickle
 from pathlib import Path
 from typing import Any
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -78,6 +79,103 @@ def save_inference_checkpoint(model: torch.nn.Module, metadata: dict, save_path:
     save_metadata(inference_filepath, metadata)
     return inference_filepath
 
+def remap_single_to_multidataset(checkpoint_state_dict: dict, dataset_name: str = 'era5') -> dict:
+    LOGGER.info("Starting key remapping from single-dataset to multi-dataset format...")
+
+    updated_state_dict = {}
+
+    # Counters for logging
+    rule_hits = defaultdict(int)
+    unchanged_keys = []
+    remapped_keys = []
+
+    for old_key, value in checkpoint_state_dict.items():
+        new_key = old_key
+
+        # --- pre/post processors (data) ---
+        if "model.pre_processors.data." in new_key:
+            new_key = new_key.replace(
+                "model.pre_processors.data.",
+                f"model.pre_processors.{dataset_name}."
+            )
+            rule_hits[f"pre_processors.data -> pre_processors.{dataset_name}"] += 1
+
+        if "model.post_processors.data." in new_key:
+            new_key = new_key.replace(
+                "model.post_processors.data.",
+                f"model.post_processors.{dataset_name}."
+            )
+            rule_hits[f"post_processors.data -> post_processors.{dataset_name}"] += 1
+
+        # --- pre/post processors (tendencies) ---
+        if "model.pre_processors_tendencies." in new_key:
+            new_key = new_key.replace(
+                "model.pre_processors_tendencies.",
+                f"model.pre_processors_tendencies.{dataset_name}."
+            )
+            rule_hits[f"pre_processors_tendencies -> *.{dataset_name}"] += 1
+
+        if "model.post_processors_tendencies." in new_key:
+            new_key = new_key.replace(
+                "model.post_processors_tendencies.",
+                f"model.post_processors_tendencies.{dataset_name}."
+            )
+            rule_hits[f"post_processors_tendencies -> *.{dataset_name}"] += 1
+
+        # --- encoder / decoder ---
+        if "model.model.encoder.data." in new_key:
+            new_key = new_key.replace(
+                "model.model.encoder.data.",
+                f"model.model.encoder.{dataset_name}."
+            )
+            rule_hits[f"encoder.data -> encoder.{dataset_name}"] += 1
+
+        if "model.model.decoder.data." in new_key:
+            new_key = new_key.replace(
+                "model.model.decoder.data.",
+                f"model.model.decoder.{dataset_name}."
+            )
+            rule_hits[f"decoder.data -> decoder.{dataset_name}"] += 1
+
+        # --- node attributes ---
+        if "model.model.node_attributes.data." in new_key:
+            new_key = new_key.replace(
+                "model.model.node_attributes.data.",
+                f"model.model.node_attributes.{dataset_name}."
+            )
+            rule_hits[f"node_attributes.data -> node_attributes.{dataset_name}"] += 1
+
+        # --- bookkeeping ---
+        if new_key == old_key:
+            unchanged_keys.append(old_key)
+        else:
+            remapped_keys.append((old_key, new_key))
+
+        updated_state_dict[new_key] = value
+
+    # --- summary logging ---
+    LOGGER.info("Key remapping summary:")
+    LOGGER.info(f"  Total checkpoint keys: {len(checkpoint_state_dict)}")
+    LOGGER.info(f"  Remapped keys: {len(remapped_keys)}")
+    LOGGER.info(f"  Unchanged keys: {len(unchanged_keys)}")
+
+    for rule, count in rule_hits.items():
+        LOGGER.info(f"  {rule}: {count} keys")
+
+    # --- examples for sanity checking ---
+    LOGGER.info("Example remapped keys (up to 10):")
+    for old_k, new_k in remapped_keys[:10]:
+        LOGGER.info(f"  {old_k} -> {new_k}")
+
+    # --- warn if something unexpected stays unmapped ---
+    if unchanged_keys:
+        LOGGER.info("Example unchanged keys (expected for dataset-agnostic modules):")
+        for k in unchanged_keys[:10]:
+            LOGGER.info(f"  {k}")
+
+    LOGGER.info("Finished key remapping")
+    return updated_state_dict
+
 
 def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> nn.Module:
     # Load the checkpoint
@@ -86,12 +184,13 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
     # apply chunking migration (fails silently otherwise leading to hard to debug issues)
     # this is due to loading with strict=False, planning to make this more robust in the future
     checkpoint = chunking_fix_migration(checkpoint)
-
-    # Filter out layers with size mismatch
+    
+    # Remap single-dataset checkpoint to multi-dataset model structure
     state_dict = checkpoint["state_dict"]
-
+    state_dict = remap_single_to_multidataset(state_dict, dataset_name='era5')
+    
+    # Filter out layers with size mismatch
     model_state_dict = model.state_dict()
-
     for key in state_dict.copy():
         if key in model_state_dict and state_dict[key].shape != model_state_dict[key].shape:
             LOGGER.info("Skipping loading parameter: %s", key)
