@@ -220,7 +220,7 @@ class AnemoiTrainer(ABC):
 
         model_task = get_class(self.config.training.model_task)
         model = model_task(**kwargs)  # GraphForecaster -> pl.LightningModule
-
+        
         # Load the model weights
         if self.load_weights_only:
             # Sanify the checkpoint for transfer learning
@@ -240,9 +240,34 @@ class AnemoiTrainer(ABC):
                 )
 
             model.data_indices = self.data_indices
-            # check data indices in original checkpoint and current data indices are the same
-            for data_indices in self.data_indices.values():
-                data_indices.compare_variables(model._ckpt_model_name_to_index, data_indices.name_to_index)
+            # check data indices in original checkpoint are compatible with at least one current dataset
+            checkpoint_compatible = False
+            compatible_datasets = []
+            
+            for dataset_name, data_indices in self.data_indices.items():
+                try:
+                    data_indices.compare_variables(model._ckpt_model_name_to_index, data_indices.name_to_index)
+                    checkpoint_compatible = True
+                    compatible_datasets.append(dataset_name)
+                    LOGGER.info(f"Checkpoint is compatible with dataset '{dataset_name}'")
+                except (AssertionError, ValueError) as e:
+                    LOGGER.warning(f"Checkpoint not compatible with dataset '{dataset_name}': {e}")
+            
+            if not checkpoint_compatible:
+                msg = (
+                    f"Checkpoint variables are not compatible with any of the current datasets. "
+                    f"Available datasets: {list(self.data_indices.keys())}"
+                )
+                raise ValueError(msg)
+            
+            LOGGER.info(f"Checkpoint compatible with datasets: {compatible_datasets}")
+            if len(compatible_datasets) != len(self.data_indices):
+                # overwrite the model's ckpt_model_name_to_index with the new dataset's "name_to_index" for future 
+                # checks
+                LOGGER.info("Overwriting model's checkpoint data indices with the multi-dataset data indices.")
+                model._ckpt_model_name_to_index = {}
+                for dataset_name, data_indices in self.data_indices.items():
+                    model._ckpt_model_name_to_index[dataset_name] = data_indices["name_to_index"]
 
         if hasattr(self.config.training, "submodules_to_freeze"):
             # Freeze the chosen model weights
