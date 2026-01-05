@@ -146,18 +146,35 @@ class BaseGraphModel(nn.Module):
             reference_dataset = dataset_names[0]
             reference_graph = self._graph_data[reference_dataset]
             reference_hidden_graph = reference_graph[(self._graph_name_hidden, "to", self._graph_name_hidden)]
+            
+            LOGGER.info(f"{reference_graph=}")
+            LOGGER.info(f"{reference_hidden_graph=}")
 
             # Check hidden graph structure consistency across all datasets
             for dataset_name in dataset_names[1:]:
                 dataset_graph = self._graph_data[dataset_name]
                 dataset_hidden_graph = dataset_graph[(self._graph_name_hidden, "to", self._graph_name_hidden)]
-
-                # Compare edge indices
-                assert torch.equal(reference_hidden_graph.edge_index, dataset_hidden_graph.edge_index), (
-                    f"Hidden-to-hidden graph edge structure mismatch between reference dataset '{reference_dataset}' "
-                    f"and dataset '{dataset_name}'. All datasets must have identical hidden graph topology "
-                    f"for the shared processor to work correctly."
+                
+                # Check if edge_index exists in both graphs - deal with transformer model which does not contain hidden 
+                # edges
+                ref_has_edges = hasattr(reference_hidden_graph, 'edge_index')
+                dataset_has_edges = hasattr(dataset_hidden_graph, 'edge_index')
+                
+                # Ensure both datasets have the same edge presence (either both have edges or both don't)
+                assert ref_has_edges == dataset_has_edges, (
+                    f"Hidden-to-hidden graph structure mismatch between reference dataset '{reference_dataset}' "
+                    f"({'has edges' if ref_has_edges else 'no edges'}) and dataset '{dataset_name}' "
+                    f"({'has edges' if dataset_has_edges else 'no edges'}). "
+                    f"All datasets must have the same hidden graph topology for the shared processor."
                 )
+                
+                # Only compare edge indices if both graphs have edges
+                if ref_has_edges and dataset_has_edges:
+                    assert torch.equal(reference_hidden_graph.edge_index, dataset_hidden_graph.edge_index), (
+                        f"Hidden-to-hidden graph edge structure mismatch between reference dataset '{reference_dataset}' "
+                        f"and dataset '{dataset_name}'. All datasets must have identical hidden graph topology "
+                        f"for the shared processor to work correctly."
+                    )
 
                 # Compare number of nodes (should be same for hidden graphs)
                 ref_num_hidden_nodes = self.node_attributes[reference_dataset].num_nodes[self._graph_name_hidden]
