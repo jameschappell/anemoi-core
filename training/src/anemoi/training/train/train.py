@@ -164,9 +164,53 @@ class AnemoiTrainer(ABC):
 
         graph_config = convert_to_omegaconf(self.config).graph
 
-        # ALWAYS override dataset from dataloader config (ignore dummy in graph config)
-        if hasattr(graph_config.nodes.data.node_builder, "dataset"):
-            graph_config.nodes.data.node_builder.dataset = dataset_path
+        # Extract dataset-specific configuration (multi-dataset case)
+        if hasattr(graph_config.nodes, dataset_name):
+            # Build new nodes config with dataset-specific + shared nodes
+            dataset_nodes = {}
+            
+            # Add dataset-specific data nodes
+            if hasattr(graph_config.nodes[dataset_name], "data"):
+                dataset_nodes["data"] = graph_config.nodes[dataset_name].data
+                # Override dataset path
+                if hasattr(dataset_nodes["data"].node_builder, "dataset"):
+                    dataset_nodes["data"].node_builder.dataset = dataset_path
+                    LOGGER.info("Overriding dataset path for '%s': %s", dataset_name, dataset_path)
+            
+            # Add shared hidden nodes
+            if hasattr(graph_config.nodes, "hidden"):
+                dataset_nodes["hidden"] = graph_config.nodes.hidden
+                LOGGER.info("Added shared hidden nodes")
+            
+            # Override nodes config
+            graph_config.nodes = dataset_nodes
+            
+            # Extract dataset-specific edges
+            if hasattr(graph_config, "edges"):
+                dataset_edges = []
+                
+                # Add dataset-specific edges (encoder/decoder)
+                if hasattr(graph_config.edges, dataset_name):
+                    dataset_edges.extend(graph_config.edges[dataset_name])
+                    LOGGER.info("Added dataset-specific edges for '%s'", dataset_name)
+                
+                # Add processor edges (shared across all datasets)
+                if hasattr(graph_config.edges, "processor"):
+                    dataset_edges.extend(graph_config.edges.processor)
+                    LOGGER.info("Added processor edges (shared)")
+                
+                # Override edges config
+                graph_config.edges = dataset_edges
+                
+        elif hasattr(graph_config.nodes, "data") and hasattr(graph_config.nodes.data, "node_builder"):
+            # Single-dataset case: directly override the node_builder dataset
+            if hasattr(graph_config.nodes.data.node_builder, "dataset"):
+                graph_config.nodes.data.node_builder.dataset = dataset_path
+                LOGGER.info("Overriding dataset path (single-dataset mode): %s", dataset_path)
+            else:
+                LOGGER.warning("Dataset node builder does not have a dataset parameter")
+        else:
+            LOGGER.warning("Could not find dataset configuration to override")
 
         return GraphCreator(config=graph_config).create(
             save_path=graph_filename,
