@@ -228,26 +228,103 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
     
     return model
 
-
-def freeze_submodule_by_name(module: nn.Module, target_name: str) -> None:
-    """Recursively freezes the parameters of a submodule with the specified name.
+def freeze_submodule_by_name(module: nn.Module, target_path: str) -> bool:
+    """Recursively freezes the parameters of a submodule at the specified path.
 
     Parameters
     ----------
     module : torch.nn.Module
         Pytorch model
-    target_name : str
-        The name of the submodule to freeze.
+    target_path : str
+        The full path to the submodule to freeze (e.g., 'model.pre_processors.era5')
+        
+    Returns
+    -------
+    bool
+        True if the submodule was found and frozen, False otherwise
     """
-    for name, child in module.named_children():
-        # If this is the target submodule, freeze its parameters
-        if name == target_name:
-            for param in child.parameters():
-                param.requires_grad = False
+    parts = target_path.split('.')
+    current = module
+    
+    # Navigate to the target submodule
+    for i, part in enumerate(parts):
+        if hasattr(current, part):
+            current = getattr(current, part)
         else:
-            # Recursively search within children
-            freeze_submodule_by_name(child, target_name)
+            current_path = '.'.join(parts[:i+1])
+            LOGGER.warning(f"Submodule path '{current_path}' not found in model. Cannot freeze '{target_path}'")
+            return False
+    
+    # Count and freeze parameters
+    frozen_count = 0
+    total_count = 0
+    frozen_params = []
+    
+    for name, param in current.named_parameters():
+        total_count += 1
+        if param.requires_grad:
+            param.requires_grad = False
+            frozen_count += 1
+            frozen_params.append(name)
+    
+    if frozen_count > 0:
+        LOGGER.info(f"✓ Froze submodule '{target_path}': {frozen_count}/{total_count} parameters")
+        LOGGER.debug(f"  Frozen parameters: {frozen_params[:5]}" + (" ..." if len(frozen_params) > 5 else ""))
+    elif total_count > 0:
+        LOGGER.info(f"⚠ Submodule '{target_path}' found but all {total_count} parameters were already frozen")
+    else:
+        LOGGER.warning(f"⚠ Submodule '{target_path}' found but contains no parameters")
+    
+    return frozen_count > 0
 
+def freeze_submodules(module: nn.Module, submodule_paths: list[str]) -> None:
+    """Freeze multiple submodules and report summary.
+    
+    Parameters
+    ----------
+    module : torch.nn.Module
+        Pytorch model
+    submodule_paths : list[str]
+        List of full paths to submodules to freeze
+    """
+    if not submodule_paths:
+        LOGGER.info("No submodules specified for freezing")
+        return
+    
+    LOGGER.info(f"Attempting to freeze {len(submodule_paths)} submodule(s)...")
+    
+    frozen_modules = []
+    not_found_modules = []
+    
+    for path in submodule_paths:
+        if freeze_submodule_by_name(module, path):
+            frozen_modules.append(path)
+        else:
+            not_found_modules.append(path)
+    
+    # Summary
+    LOGGER.info("=" * 60)
+    LOGGER.info("Freezing Summary:")
+    LOGGER.info(f"  Successfully frozen: {len(frozen_modules)}/{len(submodule_paths)} submodules")
+    
+    if frozen_modules:
+        LOGGER.info("  Frozen submodules:")
+        for path in frozen_modules:
+            LOGGER.info(f"    ✓ {path}")
+    
+    if not_found_modules:
+        LOGGER.warning("  Submodules NOT found (not frozen):")
+        for path in not_found_modules:
+            LOGGER.warning(f"    ✗ {path}")
+        LOGGER.warning("  Please check your config and model structure!")
+    
+    LOGGER.info("=" * 60)
+    
+    # Log available top-level modules for reference
+    if not_found_modules:
+        LOGGER.info("Available top-level submodules in model:")
+        for name, _ in module.named_children():
+            LOGGER.info(f"  - {name}")
 
 class LoggingUnpickler(pickle.Unpickler):
     def find_class(self, module: str, name: str) -> str:

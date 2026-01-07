@@ -37,7 +37,7 @@ from anemoi.training.diagnostics.logger import get_wandb_logger
 from anemoi.training.schemas.base_schema import BaseSchema
 from anemoi.training.schemas.base_schema import UnvalidatedBaseSchema
 from anemoi.training.schemas.base_schema import convert_to_omegaconf
-from anemoi.training.utils.checkpoint import freeze_submodule_by_name
+from anemoi.training.utils.checkpoint import freeze_submodule_by_name, freeze_submodules
 from anemoi.training.utils.checkpoint import transfer_learning_loading
 from anemoi.training.utils.config_utils import get_multiple_datasets_config
 from anemoi.training.utils.jsonify import map_config_to_primitives
@@ -314,11 +314,7 @@ class AnemoiTrainer(ABC):
                     model._ckpt_model_name_to_index[dataset_name] = data_indices["name_to_index"]
 
         if hasattr(self.config.training, "submodules_to_freeze"):
-            # Freeze the chosen model weights
-            LOGGER.info("The following submodules will NOT be trained: %s", self.config.training.submodules_to_freeze)
-            for submodule_name in self.config.training.submodules_to_freeze:
-                freeze_submodule_by_name(model, submodule_name)
-                LOGGER.info("%s frozen successfully.", submodule_name.upper())
+            freeze_submodules(model, self.config.training.submodules_to_freeze)
 
         return model
 
