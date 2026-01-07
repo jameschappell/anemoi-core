@@ -1064,7 +1064,7 @@ class BasePlotAdditionalMetrics(BasePerBatchPlotCallback):
 
         if dataset_name not in self.latlons:
             self.latlons[dataset_name] = pl_module.model.model._graph_data[dataset_name][
-                pl_module.model.model._graph_name_data
+                pl_module.model.model._graph_name_data[dataset_name]
             ].x.detach()
             self.latlons[dataset_name] = np.rad2deg(self.latlons[dataset_name].cpu().numpy())
 
