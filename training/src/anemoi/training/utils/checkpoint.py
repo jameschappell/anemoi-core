@@ -79,7 +79,7 @@ def save_inference_checkpoint(model: torch.nn.Module, metadata: dict, save_path:
     save_metadata(inference_filepath, metadata)
     return inference_filepath
 
-def remap_single_to_multidataset(checkpoint_state_dict: dict, dataset_name: str = 'era5') -> dict:
+def remap_single_to_multidataset(checkpoint_state_dict: dict, dataset_name: str = 'era5', data_node_name: str = 'data') -> dict:
     LOGGER.info("Starting key remapping from single-dataset to multi-dataset format...")
 
     updated_state_dict = {}
@@ -138,13 +138,29 @@ def remap_single_to_multidataset(checkpoint_state_dict: dict, dataset_name: str 
             rule_hits[f"decoder.data -> decoder.{dataset_name}"] += 1
 
         # --- node attributes ---
-        if "model.model.node_attributes.data." in new_key:
+        # Handle data node attributes with specific name change
+        if "model.model.node_attributes.data.latlons_data" in new_key:
+            new_key = new_key.replace(
+                "model.model.node_attributes.data.latlons_data",
+                f"model.model.node_attributes.{dataset_name}.latlons_{data_node_name}"
+            )
+            rule_hits[f"node_attributes latlons_data -> latlons_{data_node_name}"] += 1
+        
+        # Handle hidden node attributes (name stays the same)
+        elif "model.model.node_attributes.data.latlons_hidden" in new_key:
+            new_key = new_key.replace(
+                "model.model.node_attributes.data.latlons_hidden",
+                f"model.model.node_attributes.{dataset_name}.latlons_hidden"
+            )
+            rule_hits[f"node_attributes latlons_hidden -> latlons_hidden"] += 1
+        
+        # Catch-all for other node attributes
+        elif "model.model.node_attributes.data." in new_key:
             new_key = new_key.replace(
                 "model.model.node_attributes.data.",
                 f"model.model.node_attributes.{dataset_name}."
             )
             rule_hits[f"node_attributes.data -> node_attributes.{dataset_name}"] += 1
-
         # --- bookkeeping ---
         if new_key == old_key:
             unchanged_keys.append(old_key)
@@ -187,7 +203,7 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
     
     # Remap single-dataset checkpoint to multi-dataset model structure
     state_dict = checkpoint["state_dict"]
-    state_dict = remap_single_to_multidataset(state_dict, dataset_name='era5')
+    state_dict = remap_single_to_multidataset(state_dict, dataset_name='era5', data_node_name="data_global")
     
     # Filter out layers with size mismatch
     model_state_dict = model.state_dict()

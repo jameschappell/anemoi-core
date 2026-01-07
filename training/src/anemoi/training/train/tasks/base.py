@@ -221,7 +221,19 @@ class BaseGraphModule(pl.LightningModule, ABC):
         val_metrics_configs = get_multiple_datasets_config(config.training.validation_metrics)
         metrics_to_log = get_multiple_datasets_config(config.training.metrics)
         for dataset_name in self.dataset_names:
-            self.latlons_data[dataset_name] = graph_data[dataset_name][config.graph.data].x
+            # Find the data node name for this dataset (exclude hidden nodes)
+            hidden_name = config.graph.hidden
+            data_node_names = [node_type for node_type in graph_data[dataset_name].node_types if node_type != hidden_name]
+            
+            assert len(data_node_names) == 1, (
+                f"Expected exactly one data node type for dataset '{dataset_name}', "
+                f"found {len(data_node_names)}: {data_node_names}"
+            )
+            
+            data_node_name = data_node_names[0]
+            self.latlons_data[dataset_name] = graph_data[dataset_name][data_node_name].x
+            
+            LOGGER.info(f"Dataset '{dataset_name}' using data node: '{data_node_name}'")
 
             # Create dataset-specific metadata extractor
             metadata_extractor = ExtractVariableGroupAndLevel(

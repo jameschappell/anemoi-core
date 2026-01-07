@@ -41,8 +41,8 @@ class AnemoiModelEncProcDec(BaseGraphModel):
                 in_channels_src=self.input_dim[dataset_name],
                 in_channels_dst=self.node_attributes[dataset_name].attr_ndims[self._graph_name_hidden],
                 hidden_dim=self.num_channels,
-                sub_graph=self._graph_data[dataset_name][(self._graph_name_data, "to", self._graph_name_hidden)],
-                src_grid_size=self.node_attributes[dataset_name].num_nodes[self._graph_name_data],
+                sub_graph=self._graph_data[dataset_name][(self._graph_name_data[dataset_name], "to", self._graph_name_hidden)],
+                src_grid_size=self.node_attributes[dataset_name].num_nodes[self._graph_name_data[dataset_name]],
                 dst_grid_size=self.node_attributes[dataset_name].num_nodes[self._graph_name_hidden],
             )
 
@@ -70,9 +70,9 @@ class AnemoiModelEncProcDec(BaseGraphModel):
                 in_channels_dst=self.input_dim[dataset_name],
                 hidden_dim=self.num_channels,
                 out_channels_dst=self.num_output_channels[dataset_name],
-                sub_graph=self._graph_data[dataset_name][(self._graph_name_hidden, "to", self._graph_name_data)],
+                sub_graph=self._graph_data[dataset_name][(self._graph_name_hidden, "to", self._graph_name_data[dataset_name])],
                 src_grid_size=self.node_attributes[dataset_name].num_nodes[self._graph_name_hidden],
-                dst_grid_size=self.node_attributes[dataset_name].num_nodes[self._graph_name_data],
+                dst_grid_size=self.node_attributes[dataset_name].num_nodes[self._graph_name_data[dataset_name]],
             )
 
     def _assemble_input(
@@ -84,7 +84,7 @@ class AnemoiModelEncProcDec(BaseGraphModel):
         dataset_name: str = None,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[list]]:
         assert dataset_name is not None, "dataset_name must be provided when using multiple datasets."
-        node_attributes_data = self.node_attributes[dataset_name](self._graph_name_data, batch_size=batch_size)
+        node_attributes_data = self.node_attributes[dataset_name](self._graph_name_data[dataset_name], batch_size=batch_size)
         grid_shard_shapes = grid_shard_shapes[dataset_name] if grid_shard_shapes is not None else None
 
         x_skip = self.residual[dataset_name](x, grid_shard_shapes=grid_shard_shapes, model_comm_group=model_comm_group)

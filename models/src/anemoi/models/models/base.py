@@ -60,15 +60,32 @@ class BaseGraphModel(nn.Module):
         self.statistics = statistics
 
         model_config = DotDict(model_config)
-        self._graph_name_data = (
-            model_config.graph.data
-        )  # assumed to be all the same because this is how we construct the graphs
-        self._graph_name_hidden = (
-            model_config.graph.hidden
-        )  # assumed to be all the same because this is how we construct the graphs
+        # Multi-dataset: store data node names per dataset
+        # If single dataset, use model_config.graph.data
+        # If multi-dataset, detect from graph_data structure
+        self._graph_name_data = {}
+        if isinstance(graph_data, dict):
+            # Multi-dataset case: infer data node names from graph structure
+            for dataset_name, graph in graph_data.items():
+                # Find data nodes (nodes that are NOT the hidden node)
+                hidden_name = model_config.graph.hidden
+                data_node_names = [node_type for node_type in graph.node_types if node_type != hidden_name]
+                # Should typically be one data node per dataset
+                assert len(data_node_names) == 1, (
+                    f"Expected exactly one data node type for dataset '{dataset_name}', "
+                    f"found {len(data_node_names)}: {data_node_names}"
+                )
+                self._graph_name_data[dataset_name] = data_node_names[0]
+                LOGGER.info(f"Dataset '{dataset_name}' using data node: '{data_node_names[0]}'")
+        else:
+            # Single dataset case: use the configured name
+            dataset_name = list(data_indices.keys())[0]
+            self._graph_name_data[dataset_name] = model_config.graph.data
+        
+        self._graph_name_hidden = model_config.graph.hidden
         self.multi_step = model_config.training.multistep_input
         self.num_channels = model_config.model.num_channels
-
+        
         self.node_attributes = torch.nn.ModuleDict()
         for dataset_name in self._graph_data.keys():
             self.node_attributes[dataset_name] = NamedNodesAttributes(
@@ -112,7 +129,7 @@ class BaseGraphModel(nn.Module):
     def _calculate_input_dim(self, dataset_name: str) -> int:
         return (
             self.multi_step * self.num_input_channels[dataset_name]
-            + self.node_attributes[dataset_name].attr_ndims[self._graph_name_data]
+            + self.node_attributes[dataset_name].attr_ndims[self._graph_name_data[dataset_name]]
         )
 
     def _calculate_input_dim_latent(self, dataset_name: str) -> int:

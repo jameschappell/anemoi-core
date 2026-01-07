@@ -169,13 +169,13 @@ class AnemoiTrainer(ABC):
             # Build new nodes config with dataset-specific + shared nodes
             dataset_nodes = {}
             
-            # Add dataset-specific data nodes
-            if hasattr(graph_config.nodes[dataset_name], "data"):
-                dataset_nodes["data"] = graph_config.nodes[dataset_name].data
-                # Override dataset path
-                if hasattr(dataset_nodes["data"].node_builder, "dataset"):
-                    dataset_nodes["data"].node_builder.dataset = dataset_path
-                    LOGGER.info("Overriding dataset path for '%s': %s", dataset_name, dataset_path)
+            # Add dataset-specific nodes
+            for node_name in graph_config.nodes[dataset_name]:
+                dataset_nodes[node_name] = graph_config.nodes[dataset_name][node_name]
+                # Override dataset path for any node with a dataset parameter
+                if hasattr(dataset_nodes[node_name], "node_builder") and hasattr(dataset_nodes[node_name].node_builder, "dataset"):
+                    dataset_nodes[node_name].node_builder.dataset = dataset_path
+                    LOGGER.info("Overriding dataset path for '%s.%s': %s", dataset_name, node_name, dataset_path)
             
             # Add shared hidden nodes
             if hasattr(graph_config.nodes, "hidden"):
