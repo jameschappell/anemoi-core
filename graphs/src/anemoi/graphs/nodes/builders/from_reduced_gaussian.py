@@ -61,6 +61,24 @@ class ReducedGaussianGridNodes(BaseNodeBuilder):
         torch.Tensor of shape (num_nodes, 2)
             A 2D tensor with the coordinates, in radians.
         """
-        grid_data = grids(self.grid)
+        # Synchronize downloads across distributed ranks
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            
+            # Rank 0 downloads first and caches the data
+            if rank == 0:
+                LOGGER.info(f"Rank 0: Downloading grid data for {self.grid}")
+                grid_data = grids(self.grid)
+            
+            # Barrier to ensure rank 0 completes download before other ranks proceed
+            torch.distributed.barrier()
+            
+            # Other ranks can now access cached data
+            if rank != 0:
+                grid_data = grids(self.grid)
+        else:
+            # Non-distributed case
+            grid_data = grids(self.grid)
+        
         coords = self.reshape_coords(grid_data["latitudes"], grid_data["longitudes"])
         return coords
