@@ -198,6 +198,22 @@ class ReweightedGraphNodeAttributeScalerSchema(BaseModel):
     "nodes outside the mask."
     norm: Literal["unit-max", "unit-sum"] | None = Field(example="unit-sum")
     "Normalisation method applied to the node attribute."
+    
+class ReweightedTotalGraphNodeAttributeScalerSchema(BaseModel):
+    target_: Literal["anemoi.training.losses.scalers.ReweightedTotalGraphNodeAttributeScaler"] = Field(
+        ...,
+        alias="_target_",
+    )
+    nodes_name: str = Field(example="data")
+    "Name of the nodes to take the attribute from."
+    nodes_attribute_name: str = Field(example="area_weight")
+    "Name of the node attribute to return."
+    scaling_mask_attribute_name: str = Field(example="cutout_mask")
+    "Name of the node attribute to use as a mask to reweight the reference values."
+    total_weight: float = Field(example=1.0)
+    "Total weight to distribute among nodes within the scaling mask."
+    norm: Literal["unit-max", "unit-sum"] | None = Field(example="unit-sum")
+    "Normalisation method applied to the node attribute."
 
 
 ScalerSchema = (
@@ -208,6 +224,7 @@ ScalerSchema = (
     | NaNMaskScalerSchema
     | GraphNodeAttributeScalerSchema
     | ReweightedGraphNodeAttributeScalerSchema
+    | ReweightedTotalGraphNodeAttributeScalerSchema
 )
 
 

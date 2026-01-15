@@ -119,3 +119,62 @@ class ReweightedGraphNodeAttributeScaler(GraphNodeAttributeScaler):
     def get_scaling_values(self, **kwargs) -> torch.Tensor:
         attribute_values = super().get_scaling_values(**kwargs)
         return self.reweight_attribute_values(attribute_values)
+
+
+class ReweightedTotalGraphNodeAttributeScaler(GraphNodeAttributeScaler):
+    """Class for extracting and reweighting node attributes and rescaling their total sum.
+
+    Subset nodes will be scaled such that their weight sum equals the requested sum.
+    """
+
+    def __init__(
+        self,
+        graph_data: HeteroData,
+        nodes_name: str,
+        nodes_attribute_name: str,
+        scaling_mask_attribute_name: str,
+        total_weight: float,
+        output_mask: type[BaseMask] | None = None,
+        inverse: bool = False,
+        norm: str | None = None,
+        **kwargs,
+    ) -> None:
+        self.scaling_mask_attribute_name = scaling_mask_attribute_name
+        self.total_weight = total_weight
+        super().__init__(
+            graph_data=graph_data,
+            nodes_name=nodes_name,
+            nodes_attribute_name=nodes_attribute_name,
+            output_mask=output_mask,
+            inverse=inverse,
+            norm=norm,
+            **kwargs,
+        )
+        if self.scaling_mask_attribute_name not in self.nodes.node_attrs():
+            error_msg = f"{self.__class__.__module__}.{self.__class__.__name__}: "
+            error_msg += f"scaling_mask_attribute_name '{self.scaling_mask_attribute_name}' not found in graph_data - "
+            avail_masks = [k for k, v in self.nodes.items() if getattr(v, "dtype", None) == torch.bool]
+            error_msg += f"available boolean node attributes are: {avail_masks}"
+            raise KeyError(error_msg)
+
+    def reweight_attribute_values(self, values: torch.Tensor) -> torch.Tensor:
+        scaling_mask = self.nodes[self.scaling_mask_attribute_name].squeeze()
+        old_sum = torch.sum(values[scaling_mask])
+        values[scaling_mask] = values[scaling_mask] / old_sum * self.total_weight
+
+        LOGGER.info(
+            "Weight of nodes in %s rescaled such that their total sum equals %.3f",
+            self.scaling_mask_attribute_name,
+            self.total_weight,
+        )
+        LOGGER.info(
+            "New sum of %s: %.3f (previously %.3f)",
+            self.nodes_attribute_name,
+            torch.sum(values),
+            old_sum,
+        )
+        return values
+
+    def get_scaling_values(self, **kwargs) -> torch.Tensor:
+        attribute_values = super().get_scaling_values(**kwargs)
+        return self.reweight_attribute_values(attribute_values)
