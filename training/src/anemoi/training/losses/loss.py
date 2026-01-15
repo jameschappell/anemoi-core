@@ -31,6 +31,7 @@ def get_loss_function(
     config: DictConfig,
     scalers: dict[str, TENSOR_SPEC] | None = None,
     data_indices: dict | None = None,
+    statistics: dict | None = None,
     **kwargs,
 ) -> BaseLoss:
     """Get loss functions from config.
@@ -68,7 +69,7 @@ def get_loss_function(
 
     if "_target_" in loss_config and loss_config["_target_"] in NESTED_LOSSES:
         per_scale_loss_config = loss_config.pop("per_scale_loss")
-        per_scale_loss = get_loss_function(OmegaConf.create(per_scale_loss_config), scalers, data_indices)
+        per_scale_loss = get_loss_function(OmegaConf.create(per_scale_loss_config), scalers, data_indices, statistics)
         return instantiate(loss_config, per_scale_loss=per_scale_loss, **kwargs)
 
     if scalers is None:
@@ -82,7 +83,7 @@ def get_loss_function(
     if not isinstance(loss_function, BaseLoss):
         error_msg = f"Loss must be a subclass of 'BaseLoss', not {type(loss_function)}"
         raise TypeError(error_msg)
-    _apply_scalers(loss_function, scalers_to_include, scalers, data_indices)
+    _apply_scalers(loss_function, scalers_to_include, scalers, data_indices, statistics)
 
     return loss_function
 
@@ -92,6 +93,7 @@ def _apply_scalers(
     scalers_to_include: list,
     scalers: dict[str, TENSOR_SPEC] | None,
     data_indices: dict | None,
+    statistics: dict | None,
 ) -> None:
     """Attach scalers to a loss function and set data indices if needed."""
     for key in scalers_to_include:
@@ -109,6 +111,9 @@ def _apply_scalers(
 
         if hasattr(loss_function, "set_data_indices"):
             loss_function.set_data_indices(data_indices)
+        
+        if hasattr(loss_function, "set_statistics"):
+            loss_function.set_statistics(statistics)
 
 
 def get_metric_ranges(

@@ -12,6 +12,7 @@ import functools
 import logging
 from abc import ABC
 from abc import abstractmethod
+from typing import Any
 
 import torch
 from torch import nn
@@ -73,6 +74,9 @@ class BaseLoss(nn.Module, ABC):
 
     def set_data_indices(self, data_indices: IndexCollection) -> None:
         """Hook to set the data indices for the loss."""
+        
+    def set_statistics(self, statistics: dict) -> None:
+        """Hook to set the statistics for the loss."""
 
     def scale(
         self,
