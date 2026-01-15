@@ -10,6 +10,8 @@
 
 import logging
 import re
+import os
+import time
 
 import torch
 
@@ -78,6 +80,12 @@ class ReducedGaussianGridNodes(BaseNodeBuilder):
                 grid_data = grids(self.grid)
         else:
             # Non-distributed case
+            # Check if we're in a multi-process environment (even if distributed not yet initialized)
+            local_rank = os.environ.get("LOCAL_RANK")
+            if local_rank is not None and int(local_rank) != 0:
+                # Wait for rank 0 to download and cache the data
+                LOGGER.info(f"Rank {local_rank}: Waiting for rank 0 to cache grid data for {self.grid}")
+                time.sleep(3)
             grid_data = grids(self.grid)
         
         coords = self.reshape_coords(grid_data["latitudes"], grid_data["longitudes"])
