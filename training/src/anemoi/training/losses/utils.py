@@ -59,7 +59,14 @@ def print_variable_scaling(loss: BaseLoss, data_indices: IndexCollection) -> dic
     log_text = f"Final Variable Scaling in {loss.__class__.__name__}: "
     scaling_values, scaling_sum = {}, 0.0
 
-    for idx, name in enumerate(data_indices.model.output.name_to_index.keys()):
+    # temporary workaround for FSSLoss - variable scaler only applies to precip fields so can't map directly to model 
+    # output
+    if hasattr(loss, "loss_vars_name_to_index"):
+        idxs_src = loss.loss_vars_name_to_index
+    else:
+        idxs_src = data_indices.model.output.name_to_index
+
+    for idx, name in enumerate(idxs_src.keys()):
         value = float(variable_scaling[idx])
         log_text += f"{name}: {value:.4g}, "
         scaling_values[name] = value
