@@ -208,7 +208,7 @@ class MultiDataset(IterableDataset):
         A date t is valid if we can sample the elements t + i
         for every relative_date_index i.
         """
-        valid_date_indices_ref = None
+        valid_date_indices_intersection = None
         for ds in self.datasets.values():
             valid_date_indices = get_usable_indices(
                 ds.data.missing,
@@ -216,13 +216,23 @@ class MultiDataset(IterableDataset):
                 self.data_relative_date_indices,
                 ds.data.trajectory_ids,
             )
-            if valid_date_indices_ref is None:
-                valid_date_indices_ref = valid_date_indices
-            assert np.array_equal(
-                valid_date_indices_ref,
-                valid_date_indices,
-            ), "Datasets have different valid_date_indices, cannot synchronize samples"
-        return valid_date_indices_ref
+            if valid_date_indices_intersection is None:
+                valid_date_indices_intersection = valid_date_indices
+            else:
+                valid_date_indices_intersection = np.intersect1d(
+                    valid_date_indices_intersection,
+                    valid_date_indices,
+                    assume_unique=True,
+                )
+        assert valid_date_indices_intersection is not None, "No datasets found to compute valid date indices."
+
+        LOGGER.info(
+            "Valid date indices intersection across %d datasets: %d indices",
+            len(self.datasets),
+            len(valid_date_indices_intersection),
+        )
+
+        return valid_date_indices_intersection
 
     def set_comm_group_info(
         self,
