@@ -60,32 +60,15 @@ class BaseGraphModel(nn.Module):
         self.statistics = statistics
 
         model_config = DotDict(model_config)
-        # Multi-dataset: store data node names per dataset
-        # If single dataset, use model_config.graph.data
-        # If multi-dataset, detect from graph_data structure
-        self._graph_name_data = {}
-        if isinstance(graph_data, dict):
-            # Multi-dataset case: infer data node names from graph structure
-            for dataset_name, graph in graph_data.items():
-                # Find data nodes (nodes that are NOT the hidden node)
-                hidden_name = model_config.graph.hidden
-                data_node_names = [node_type for node_type in graph.node_types if node_type != hidden_name]
-                # Should typically be one data node per dataset
-                assert len(data_node_names) == 1, (
-                    f"Expected exactly one data node type for dataset '{dataset_name}', "
-                    f"found {len(data_node_names)}: {data_node_names}"
-                )
-                self._graph_name_data[dataset_name] = data_node_names[0]
-                LOGGER.info(f"Dataset '{dataset_name}' using data node: '{data_node_names[0]}'")
-        else:
-            # Single dataset case: use the configured name
-            dataset_name = list(data_indices.keys())[0]
-            self._graph_name_data[dataset_name] = model_config.graph.data
-        
-        self._graph_name_hidden = model_config.graph.hidden
+        self._graph_name_data = (
+            model_config.graph.data
+        )  # assumed to be all the same because this is how we construct the graphs
+        self._graph_name_hidden = (
+            model_config.graph.hidden
+        )  # assumed to be all the same because this is how we construct the graphs
         self.multi_step = model_config.training.multistep_input
         self.num_channels = model_config.model.num_channels
-        
+
         self.node_attributes = torch.nn.ModuleDict()
         for dataset_name in self._graph_data.keys():
             self.node_attributes[dataset_name] = NamedNodesAttributes(
@@ -129,7 +112,7 @@ class BaseGraphModel(nn.Module):
     def _calculate_input_dim(self, dataset_name: str) -> int:
         return (
             self.multi_step * self.num_input_channels[dataset_name]
-            + self.node_attributes[dataset_name].attr_ndims[self._graph_name_data[dataset_name]]
+            + self.node_attributes[dataset_name].attr_ndims[self._graph_name_data]
         )
 
     def _calculate_input_dim_latent(self, dataset_name: str) -> int:
@@ -168,27 +151,13 @@ class BaseGraphModel(nn.Module):
             for dataset_name in dataset_names[1:]:
                 dataset_graph = self._graph_data[dataset_name]
                 dataset_hidden_graph = dataset_graph[(self._graph_name_hidden, "to", self._graph_name_hidden)]
-                
-                # Check if edge_index exists in both graphs - deal with transformer model which does not contain hidden 
-                # edges
-                ref_has_edges = hasattr(reference_hidden_graph, 'edge_index')
-                dataset_has_edges = hasattr(dataset_hidden_graph, 'edge_index')
-                
-                # Ensure both datasets have the same edge presence (either both have edges or both don't)
-                assert ref_has_edges == dataset_has_edges, (
-                    f"Hidden-to-hidden graph structure mismatch between reference dataset '{reference_dataset}' "
-                    f"({'has edges' if ref_has_edges else 'no edges'}) and dataset '{dataset_name}' "
-                    f"({'has edges' if dataset_has_edges else 'no edges'}). "
-                    f"All datasets must have the same hidden graph topology for the shared processor."
+
+                # Compare edge indices
+                assert torch.equal(reference_hidden_graph.edge_index, dataset_hidden_graph.edge_index), (
+                    f"Hidden-to-hidden graph edge structure mismatch between reference dataset '{reference_dataset}' "
+                    f"and dataset '{dataset_name}'. All datasets must have identical hidden graph topology "
+                    f"for the shared processor to work correctly."
                 )
-                
-                # Only compare edge indices if both graphs have edges
-                if ref_has_edges and dataset_has_edges:
-                    assert torch.equal(reference_hidden_graph.edge_index, dataset_hidden_graph.edge_index), (
-                        f"Hidden-to-hidden graph edge structure mismatch between reference dataset '{reference_dataset}' "
-                        f"and dataset '{dataset_name}'. All datasets must have identical hidden graph topology "
-                        f"for the shared processor to work correctly."
-                    )
 
                 # Compare number of nodes (should be same for hidden graphs)
                 ref_num_hidden_nodes = self.node_attributes[reference_dataset].num_nodes[self._graph_name_hidden]
@@ -222,6 +191,14 @@ class BaseGraphModel(nn.Module):
             assert (
                 model_comm_group.size() == 1 or ensemble_size == 1
             ), "Ensemble size per device must be 1 when model is sharded across GPUs"
+
+    def _get_consistent_dim(self, x: dict[str, Tensor], dim: int) -> int:
+        dim_sizes = [_x.shape[dim] for _x in x.values()]
+
+        # Assert all datasets have the same sizes
+        assert all(bs == dim_sizes[0] for bs in dim_sizes), f"Dimensions must be the same across datasets: {dim_sizes}"
+
+        return dim_sizes[0]
 
     @abstractmethod
     def _build_networks(self, model_config: DotDict) -> None:

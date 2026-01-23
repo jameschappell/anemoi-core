@@ -29,6 +29,7 @@ from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from torch_geometric.data import HeteroData
 
 from anemoi.models.utils.compile import mark_for_compilation
+from anemoi.models.utils.config import get_multiple_datasets_config
 from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
 from anemoi.training.diagnostics.callbacks import get_callbacks
 from anemoi.training.diagnostics.logger import get_mlflow_logger
@@ -164,53 +165,9 @@ class AnemoiTrainer(ABC):
 
         graph_config = convert_to_omegaconf(self.config).graph
 
-        # Extract dataset-specific configuration (multi-dataset case)
-        if hasattr(graph_config.nodes, dataset_name):
-            # Build new nodes config with dataset-specific + shared nodes
-            dataset_nodes = {}
-            
-            # Add dataset-specific nodes
-            for node_name in graph_config.nodes[dataset_name]:
-                dataset_nodes[node_name] = graph_config.nodes[dataset_name][node_name]
-                # Override dataset path for any node with a dataset parameter
-                if hasattr(dataset_nodes[node_name], "node_builder") and hasattr(dataset_nodes[node_name].node_builder, "dataset"):
-                    dataset_nodes[node_name].node_builder.dataset = dataset_path
-                    LOGGER.info("Overriding dataset path for '%s.%s': %s", dataset_name, node_name, dataset_path)
-            
-            # Add shared hidden nodes
-            if hasattr(graph_config.nodes, "hidden"):
-                dataset_nodes["hidden"] = graph_config.nodes.hidden
-                LOGGER.info("Added shared hidden nodes")
-            
-            # Override nodes config
-            graph_config.nodes = dataset_nodes
-            
-            # Extract dataset-specific edges
-            if hasattr(graph_config, "edges"):
-                dataset_edges = []
-                
-                # Add dataset-specific edges (encoder/decoder)
-                if hasattr(graph_config.edges, dataset_name):
-                    dataset_edges.extend(graph_config.edges[dataset_name])
-                    LOGGER.info("Added dataset-specific edges for '%s'", dataset_name)
-                
-                # Add processor edges (shared across all datasets)
-                if hasattr(graph_config.edges, "processor"):
-                    dataset_edges.extend(graph_config.edges.processor)
-                    LOGGER.info("Added processor edges (shared)")
-                
-                # Override edges config
-                graph_config.edges = dataset_edges
-                
-        elif hasattr(graph_config.nodes, "data") and hasattr(graph_config.nodes.data, "node_builder"):
-            # Single-dataset case: directly override the node_builder dataset
-            if hasattr(graph_config.nodes.data.node_builder, "dataset"):
-                graph_config.nodes.data.node_builder.dataset = dataset_path
-                LOGGER.info("Overriding dataset path (single-dataset mode): %s", dataset_path)
-            else:
-                LOGGER.warning("Dataset node builder does not have a dataset parameter")
-        else:
-            LOGGER.warning("Could not find dataset configuration to override")
+        # ALWAYS override dataset from dataloader config (ignore dummy in graph config)
+        if hasattr(graph_config.nodes, "data") and hasattr(graph_config.nodes.data.node_builder, "dataset"):
+            graph_config.nodes.data.node_builder.dataset = dataset_path
 
         return GraphCreator(config=graph_config).create(
             save_path=graph_filename,
@@ -227,7 +184,7 @@ class AnemoiTrainer(ABC):
     def graph_data(self) -> HeteroData | dict[str, HeteroData]:
         """Graph data. Always uses dataset paths from dataloader config."""
         graphs = {}
-        dataset_configs = get_multiple_datasets_config(self.config.dataloader.training)
+        dataset_configs = get_multiple_datasets_config(convert_to_omegaconf(self.config).dataloader.training)
         for dataset_name, dataset_config in dataset_configs.items():
             LOGGER.info("Creating graph for dataset '%s'", dataset_name)
             graphs[dataset_name] = self._create_graph_for_dataset(dataset_config.dataset, dataset_name)
@@ -426,7 +383,7 @@ class AnemoiTrainer(ABC):
             "dataset": None,  # will be populated in DataModule
             "data_indices": None,  # will be populated in DataModule
             "provenance_training": gather_provenance_info(),
-            "timestamp": datetime.datetime.now(tz=datetime.timezone.utc),
+            "timestamp": datetime.datetime.now(tz=datetime.UTC),
             "metadata_inference": metadata_inference,
             "uuid": None,  # will be populated in checkpoint callback
         }
@@ -466,18 +423,15 @@ class AnemoiTrainer(ABC):
         return self.config.system.hardware.accelerator
 
     def _log_information(self) -> None:
-        # Log number of variables (features)
-        # Multi-dataset case: log per dataset
-        from anemoi.training.utils.config_utils import get_dataset_data_config
-
+        # Log number of variables (features) per dataset
         for dataset_name, data in self.datamodule.ds_train.data.items():
-            dataset_data_config = get_dataset_data_config(self.config, dataset_name)
-            num_fc_features = len(data.variables) - len(dataset_data_config.forcing)
+            num_forcing_features = len(self.data_indices[dataset_name].forcing)
+            num_fc_features = len(data.variables) - num_forcing_features
             LOGGER.info("Dataset '%s' - Total number of prognostic variables: %d", dataset_name, num_fc_features)
             LOGGER.info(
                 "Dataset '%s' - Total number of auxiliary variables: %d",
                 dataset_name,
-                len(dataset_data_config.forcing),
+                num_forcing_features,
             )
 
         # Log learning rate multiplier when running single-node, multi-GPU and/or multi-node

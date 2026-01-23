@@ -26,6 +26,7 @@ from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.distributed.graph import gather_tensor
 from anemoi.models.distributed.shapes import apply_shard_shapes
 from anemoi.models.interface import AnemoiModelInterface
+from anemoi.models.utils.config import get_multiple_datasets_config
 from anemoi.training.losses import get_loss_function
 from anemoi.training.losses.base import BaseLoss
 from anemoi.training.losses.loss import get_metric_ranges
@@ -34,9 +35,6 @@ from anemoi.training.losses.scalers import create_scalers
 from anemoi.training.losses.scalers.base_scaler import AvailableCallbacks
 from anemoi.training.losses.scalers.base_scaler import BaseScaler
 from anemoi.training.losses.utils import print_variable_scaling
-from anemoi.training.schemas.base_schema import BaseSchema
-from anemoi.training.schemas.base_schema import convert_to_omegaconf
-from anemoi.training.utils.config_utils import get_multiple_datasets_config
 from anemoi.training.utils.enums import TensorDim
 from anemoi.training.utils.variables_metadata import ExtractVariableGroupAndLevel
 
@@ -47,7 +45,7 @@ if TYPE_CHECKING:
     from torch_geometric.data import HeteroData
 
     from anemoi.models.data_indices.collection import IndexCollection
-
+    from anemoi.training.schemas.base_schema import BaseSchema
 
 LOGGER = logging.getLogger(__name__)
 
@@ -179,13 +177,17 @@ class BaseGraphModule(pl.LightningModule, ABC):
         for name in self.dataset_names:
             self.output_mask[name] = instantiate(config.model.output_mask, graph_data=graph_data[name])
 
-        # Handle supporting_arrays merge for multi-dataset
-        # Multi-dataset: merge supporting arrays from all output masks
+        # Handle supporting_arrays merge with all output masks
         combined_supporting_arrays = supporting_arrays.copy()
-        for mask in self.output_mask.values():
-            combined_supporting_arrays.update(mask.supporting_arrays)
+        for dataset_name, mask in self.output_mask.items():
+            combined_supporting_arrays[dataset_name].update(mask.supporting_arrays)
 
-        metadata["metadata_inference"]["task"] = self._get_task_type_from_config(config)
+        if not hasattr(self.__class__, "task_type"):
+            msg = """Subclasses of BaseGraphModule must define a `task_type` class attribute,
+                indicating the type of task (e.g., 'forecaster', 'time-interpolator')."""
+            raise AttributeError(msg)
+
+        metadata["metadata_inference"]["task"] = self.task_type
 
         self.model = AnemoiModelInterface(
             statistics=statistics,
@@ -221,19 +223,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
         val_metrics_configs = get_multiple_datasets_config(config.training.validation_metrics)
         metrics_to_log = get_multiple_datasets_config(config.training.metrics)
         for dataset_name in self.dataset_names:
-            # Find the data node name for this dataset (exclude hidden nodes)
-            hidden_name = config.graph.hidden
-            data_node_names = [node_type for node_type in graph_data[dataset_name].node_types if node_type != hidden_name]
-            
-            assert len(data_node_names) == 1, (
-                f"Expected exactly one data node type for dataset '{dataset_name}', "
-                f"found {len(data_node_names)}: {data_node_names}"
-            )
-            
-            data_node_name = data_node_names[0]
-            self.latlons_data[dataset_name] = graph_data[dataset_name][data_node_name].x
-            
-            LOGGER.info(f"Dataset '{dataset_name}' using data node: '{data_node_name}'")
+            self.latlons_data[dataset_name] = graph_data[dataset_name][config.graph.data].x
 
             # Create dataset-specific metadata extractor
             metadata_extractor = ExtractVariableGroupAndLevel(
@@ -265,7 +255,6 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 loss_configs[dataset_name],
                 dataset_scalers,
                 data_indices[dataset_name],
-                statistics[dataset_name],
             )
 
             self.metrics[dataset_name] = self._build_metrics_for_dataset(
@@ -343,15 +332,6 @@ class BaseGraphModule(pl.LightningModule, ABC):
         """Get the loss name for multi-dataset cases."""
         # For multi-dataset, use a generic name or combine dataset names
         return "multi_dataset"
-
-    def _get_task_type_from_config(self, config: dict) -> str:
-        task_class_name = str(config.training.model_task).split(".")[-1]
-
-        try:
-            return TASK_TYPE_MAP[task_class_name]
-        except KeyError as exc:
-            err_msg = f"Unknown task type: {task_class_name}"
-            raise ValueError(err_msg) from exc
 
     def _check_sharding_support(self) -> None:
         self.loss_supports_sharding = all(getattr(loss, "supports_sharding", False) for loss in self.loss.values())
@@ -554,6 +534,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
             Computed loss
         """
         assert dataset_name is not None, "dataset_name must be provided when using multiple datasets"
+
         return self.loss[dataset_name](
             y_pred,
             y,
@@ -642,7 +623,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 **kwargs,
             )
 
-        return loss, metrics_next, y_pred_full
+        return loss, metrics_next, y_pred
 
     def compute_loss_metrics(
         self,
@@ -682,7 +663,14 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 **kwargs,
             )
 
-            total_loss = dataset_loss if total_loss is None else total_loss + dataset_loss
+            if dataset_loss is not None:
+                dataset_loss_sum = dataset_loss.sum()  # collapse potential multi-scale loss
+                total_loss = dataset_loss_sum if total_loss is None else total_loss + dataset_loss_sum
+
+                if validation_mode:
+                    loss_obj = self.loss[dataset_name]
+                    loss_name = getattr(loss_obj, "name", loss_obj.__class__.__name__.lower())
+                    metrics_next[f"{dataset_name}_{loss_name}_loss"] = dataset_loss
 
             # Prefix dataset name to metric keys
             for metric_name, metric_value in dataset_metrics.items():
@@ -1038,7 +1026,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
         # The conditions should be separate, but are combined due to pre-commit hook
         if stage == "fit" and self.trainer.is_global_zero and self.logger is not None:
             # Log hyperparameters on rank 0
-            hyper_params = OmegaConf.to_container(convert_to_omegaconf(self.config), resolve=True)
+            hyper_params = OmegaConf.to_container(self.config, resolve=True)
             hyper_params.update({"variable_loss_scaling": self._scaling_values_log})
             # Log hyperparameters
             self.logger.log_hyperparams(hyper_params)

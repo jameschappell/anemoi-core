@@ -19,6 +19,7 @@ from rich.console import Console
 from rich.tree import Tree
 from torch.utils.data import IterableDataset
 
+from anemoi.models.distributed.balanced_partition import get_balanced_partition_range
 from anemoi.training.data.dataset import NativeGridDataset
 from anemoi.training.utils.seeding import get_base_seed
 from anemoi.training.utils.usable_indices import get_usable_indices
@@ -207,7 +208,7 @@ class MultiDataset(IterableDataset):
         A date t is valid if we can sample the elements t + i
         for every relative_date_index i.
         """
-        valid_date_indices_intersection = None
+        valid_date_indices_ref = None
         for ds in self.datasets.values():
             valid_date_indices = get_usable_indices(
                 ds.data.missing,
@@ -215,24 +216,14 @@ class MultiDataset(IterableDataset):
                 self.data_relative_date_indices,
                 ds.data.trajectory_ids,
             )
-            if valid_date_indices_intersection is None:
-                valid_date_indices_intersection = valid_date_indices
-            else:
-                valid_date_indices_intersection = np.intersect1d(
-                    valid_date_indices_intersection,
-                    valid_date_indices,
-                    assume_unique=True,
-                )
-        assert valid_date_indices_intersection is not None, "No datasets found to compute valid date indices."
-        
-        LOGGER.info(
-            "Valid date indices intersection across %d datasets: %d indices",
-            len(self.datasets),
-            len(valid_date_indices_intersection),
-        )
-        
-        return valid_date_indices_intersection
-    
+            if valid_date_indices_ref is None:
+                valid_date_indices_ref = valid_date_indices
+            assert np.array_equal(
+                valid_date_indices_ref,
+                valid_date_indices,
+            ), "Datasets have different valid_date_indices, cannot synchronize samples"
+        return valid_date_indices_ref
+
     def set_comm_group_info(
         self,
         global_rank: int,
@@ -322,22 +313,19 @@ class MultiDataset(IterableDataset):
         )
 
     def per_worker_init(self, n_workers: int, worker_id: int) -> None:
-        """Initialize all datasets for this worker.
-        
-        Updates chunk_index_range based on the overlapping valid_date_indices.
-        """
+        """Initialize all datasets for this worker."""
         self.worker_id = worker_id
 
-        # Divide this equally across shards (one shard per group!)
+        # 1. divide valid date indices into shards for sample communication groups (DDP ranks)
+        # note that we need even splits here across DDP ranks, so we might throw away some samples
         shard_size = len(self.valid_date_indices) // self.sample_comm_num_groups
         shard_start = self.sample_comm_group_id * shard_size
-        shard_end = (self.sample_comm_group_id + 1) * shard_size
 
-        shard_len = shard_end - shard_start
-        self.n_samples_per_worker = shard_len // n_workers
+        self.n_samples_per_worker = shard_size // n_workers
 
-        low = shard_start + worker_id * self.n_samples_per_worker
-        high = min(shard_start + (worker_id + 1) * self.n_samples_per_worker, shard_end)
+        # 2. partition the shard across workers (here we can have uneven splits, so we use a balanced partition)
+        low, high = get_balanced_partition_range(shard_size, n_workers, worker_id, offset=shard_start)
+
         self.chunk_index_range = np.arange(low, high, dtype=np.uint32)
 
         LOGGER.info(
@@ -351,19 +339,18 @@ class MultiDataset(IterableDataset):
         )
 
         base_seed = get_base_seed()
+
         torch.manual_seed(base_seed)
         random.seed(base_seed)
         self.rng = np.random.default_rng(seed=base_seed)
         sanity_rnd = self.rng.random(1)
         LOGGER.info(
-            "MultiDataset Worker %d (pid %d, global_rank %d, sanity_rnd %f) has chunk range [%d:%d] for %d overlapping indices",
+            ("Worker %d (%s, pid %d, base_seed %d, sanity rnd %f)"),
             worker_id,
+            self.label,
             os.getpid(),
-            self.global_rank,
+            base_seed,
             sanity_rnd,
-            low,
-            high,
-            len(self.valid_date_indices),
         )
 
     def get_sample(self, index: int) -> dict[str, torch.Tensor]:
