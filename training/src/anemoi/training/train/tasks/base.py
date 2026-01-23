@@ -255,6 +255,7 @@ class BaseGraphModule(pl.LightningModule, ABC):
                 loss_configs[dataset_name],
                 dataset_scalers,
                 data_indices[dataset_name],
+                statistics[dataset_name],
             )
 
             self.metrics[dataset_name] = self._build_metrics_for_dataset(
