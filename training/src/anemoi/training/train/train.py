@@ -166,10 +166,11 @@ class AnemoiTrainer(ABC):
         graph_config = convert_to_omegaconf(self.config).graph
 
         # ALWAYS override dataset from dataloader config (ignore dummy in graph config)
-        if hasattr(graph_config.nodes, "data") and hasattr(graph_config.nodes.data.node_builder, "dataset"):
-            graph_config.nodes.data.node_builder.dataset = dataset_path
+        if hasattr(graph_config.datasets[dataset_name].nodes, "data") and hasattr(graph_config.datasets[dataset_name].nodes.data.node_builder, "dataset"):
+            graph_config.datasets[dataset_name].nodes.data.node_builder.dataset = dataset_path
 
-        return GraphCreator(config=graph_config).create(
+        # pass the dataset-specific graph_config to the GraphCreator
+        return GraphCreator(config=graph_config.datasets[dataset_name]).create(
             save_path=graph_filename,
             overwrite=self.config.graph.overwrite,
         )
