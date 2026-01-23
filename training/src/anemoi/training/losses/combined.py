@@ -138,6 +138,14 @@ class CombinedLoss(BaseLoss):
         self.loss_weights = loss_weights
         del self.scaler  # Remove scaler property from parent class, as it is not used here
 
+    @property
+    def scaler(self):
+        """Return the first loss's scaler for compatibility with plotting code."""
+        # Return first loss's scaler if available, otherwise return None
+        if self.losses and hasattr(self.losses[0], 'scaler'):
+            return self.losses[0].scaler
+        return None
+
     def set_data_indices(self, data_indices: IndexCollection) -> None:
         for loss in self.losses:
             if hasattr(loss, "set_data_indices"):
