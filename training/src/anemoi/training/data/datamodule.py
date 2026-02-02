@@ -15,6 +15,7 @@ import pytorch_lightning as pl
 from hydra.utils import instantiate
 from torch.utils.data import DataLoader
 from torch_geometric.data import HeteroData
+from multiprocessing import Value
 
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.utils.config import get_multiple_datasets_config
@@ -58,7 +59,11 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
 
         if not self.config.dataloader.pin_memory:
             LOGGER.info("Data loader memory pinning disabled.")
-
+         
+        # Initialize rollout shared value   
+        rollout_cfg = getattr(getattr(self.config, "training", None), "rollout", None)
+        self._rollout_shared_value = Value('i', rollout_cfg.start if rollout_cfg else 1)
+    
     @cached_property
     def statistics(self) -> dict:
         """Return statistics from all training datasets."""
@@ -100,24 +105,23 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         """Determine a list of relative time indices to load for each batch."""
         if hasattr(self.config.training, "explicit_times"):
             return sorted(set(self.config.training.explicit_times.input + self.config.training.explicit_times.target))
-
-        # Calculate indices using multistep, timeincrement and rollout
-        rollout_cfg = getattr(getattr(self.config, "training", None), "rollout", None)
-
-        rollout_max = getattr(rollout_cfg, "max", None)
-        rollout_start = getattr(rollout_cfg, "start", 1)
-        rollout_epoch_increment = getattr(rollout_cfg, "epoch_increment", 0)
-
-        rollout_value = rollout_start
-        if rollout_cfg and rollout_epoch_increment > 0 and rollout_max is not None:
-            rollout_value = rollout_max
-        else:
-            LOGGER.warning("Falling back rollout to: %s", rollout_value)
-
+    
+        # Use the rollout shared value
+        rollout_value = self._rollout_shared_value.value
         rollout = max(rollout_value, val_rollout)
         multi_step = self.config.training.multistep_input
         return list(range(multi_step + rollout))
-
+    
+    def reset_datasets(self) -> None:
+        """Clear cached datasets to force recreation with new rollout."""
+        for attr in ["ds_train", "ds_valid", "ds_test"]:
+            if attr in self.__dict__:
+                del self.__dict__[attr]
+        LOGGER.info(
+            "Dataset caches cleared, will recreate with rollout=%d",
+            self._rollout_shared_value.value,
+        )
+    
     @cached_property
     def grid_indices(self) -> dict[str, type[BaseGridIndices]]:
         """Initialize grid indices for spatial sharding for each dataset."""

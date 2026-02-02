@@ -209,7 +209,15 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
         pass
 
     def on_train_epoch_end(self) -> None:
-        if self.rollout_epoch_increment > 0 and self.current_epoch % self.rollout_epoch_increment == 0:
-            self.rollout += 1
-            LOGGER.debug("Rollout window length: %d", self.rollout)
-        self.rollout = min(self.rollout, self.rollout_max)
+        """Update rollout at the end of each training epoch."""
+        # Check if rollout should be incremented
+        if self.rollout_epoch_increment > 0 and (self.current_epoch + 1) % self.rollout_epoch_increment == 0:
+            old_rollout = self.rollout
+            self.rollout = min(self.rollout + 1, self.rollout_max)
+            
+            # Only update datamodule if rollout actually changed
+            if self.rollout != old_rollout:
+                LOGGER.info("Rollout increased from %d to %d", old_rollout, self.rollout)
+                self.trainer.datamodule._rollout_shared_value.value = self.rollout
+                # Reset datasets to apply new rollout
+                self.trainer.datamodule.reset_datasets()
