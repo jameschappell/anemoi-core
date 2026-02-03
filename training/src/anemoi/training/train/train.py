@@ -557,8 +557,6 @@ class AnemoiTrainer(ABC):
             use_distributed_sampler=False,
             enable_progress_bar=self.config.diagnostics.enable_progress_bar,
             check_val_every_n_epoch=getattr(self.config.diagnostics, "check_val_every_n_epoch", 1),
-            # Reload dataloaders when rollout changes
-            reload_dataloaders_every_n_epochs=self.model.rollout_epoch_increment if self.model.rollout_epoch_increment > 0 else 0,
         )
 
         self.prepare_compilation()

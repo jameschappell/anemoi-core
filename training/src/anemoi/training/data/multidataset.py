@@ -39,6 +39,8 @@ class MultiDataset(IterableDataset):
         timestep: str = "6h",
         shuffle: bool = True,
         label: str = "multi",
+        rollout_shared_value = None,
+        multi_step: int = 1,
     ) -> None:
         """Initialize multi-dataset with synchronized datasets.
 
@@ -64,6 +66,12 @@ class MultiDataset(IterableDataset):
         self.timestep = timestep
         self.dataset_names = list(data_readers.keys())
         self.grid_indices = grid_indices
+        self.rollout_shared_value = rollout_shared_value
+        
+        # Store initial relative_date_indices, but will be computed dynamically for different rollouts
+        self._initial_relative_date_indices = relative_date_indices
+        self.multi_step = multi_step
+        self._cached_data_relative_date_indices = None
 
         # Create individual NativeGridDataset for each dataset with its own grid_indices
         self.datasets = {}
@@ -73,13 +81,6 @@ class MultiDataset(IterableDataset):
                 raise ValueError(msg)
 
             self.datasets[name] = create_dataset(data_reader)
-
-        # relative_date_indices are computed in terms of data frequency
-        # data_relative_date_indices are in terms of the specific dataset
-        self.data_relative_date_indices = np.array(
-            [self.timeincrement * idx for idx in relative_date_indices],
-            dtype=np.int64,
-        )
 
         LOGGER.info(
             "MultiDataset initialized with %d datasets (%s), %d valid indices each",
@@ -204,13 +205,21 @@ class MultiDataset(IterableDataset):
 
         A date t is valid if we can sample the elements t + i
         for every relative_date_index i.
+        
+        Uses the initial relative_date_indices which should be sized for max rollout.
         """
+        # Use initial indices (which should be max rollout size)
+        initial_data_indices = np.array(
+            [self.timeincrement * idx for idx in self._initial_relative_date_indices],
+            dtype=np.int64,
+        )
+        
         valid_date_indices_ref = None
         for ds in self.datasets.values():
             valid_date_indices = get_usable_indices(
                 ds.missing,
                 len(ds.dates),
-                self.data_relative_date_indices,
+                initial_data_indices,
                 ds.trajectory_ids if ds.has_trajectories else None,
             )
             if valid_date_indices_ref is None:
@@ -220,6 +229,21 @@ class MultiDataset(IterableDataset):
             assert np.array_equal(valid_date_indices_ref, valid_date_indices), err_msg
 
         return valid_date_indices_ref
+    
+    @property
+    def data_relative_date_indices(self) -> np.ndarray:
+        """Compute relative date indices dynamically based on current rollout."""
+        if self.rollout_shared_value is not None:
+            # Dynamically compute based on current rollout value
+            rollout = self.rollout_shared_value.value
+            relative_indices = list(range(self.multi_step + rollout))
+        else:
+            relative_indices = self._initial_relative_date_indices
+
+        return np.array(
+            [self.timeincrement * idx for idx in relative_indices],
+            dtype=np.int64,
+        )
 
     def set_comm_group_info(
         self,
@@ -365,18 +389,13 @@ class MultiDataset(IterableDataset):
             x[name] = dataset.get_sample(time_indices, grid_shard_indices)
 
         return x
-
+    
     def __iter__(self) -> dict[str, torch.Tensor]:
-        """Return an iterator that yields dictionaries of synchronized samples.
+        """Return an iterator that yields dictionaries of synchronized samples."""
 
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Dictionary mapping dataset names to their tensor samples
-            Format: {"dataset_a": tensor_a, "dataset_b": tensor_b, ...}
-        """
-        # Get the shuffled indices from the primary dataset
-        # All datasets will use the same shuffled indices for synchronization
+        cached_relative_indices = self.data_relative_date_indices.copy()
+        timeincrement = cached_relative_indices[1] - cached_relative_indices[0] if len(cached_relative_indices) > 1 else 1
+        
         if self.shuffle:
             shuffled_chunk_indices = self.rng.choice(
                 self.valid_date_indices,
@@ -393,10 +412,23 @@ class MultiDataset(IterableDataset):
             self.worker_id,
             shuffled_chunk_indices[:10],
         )
-        # TODO(): improve this...
+        
         for i in shuffled_chunk_indices:
-            yield self.get_sample(i)
-
+            start_idx = self.valid_date_indices[i]
+            time_indices = slice(
+                start_idx + cached_relative_indices[0],
+                start_idx + cached_relative_indices[-1] + 1,
+                timeincrement,
+            )
+            
+            yield {
+                name: dataset.get_sample(
+                    time_indices=time_indices,
+                    grid_shard_indices=self.grid_indices[name].get_shard_indices(self.reader_group_rank),
+                )
+                for name, dataset in self.datasets.items()
+            }
+    
     def __repr__(self) -> str:
         console = Console(record=True, width=120)
         with console.capture() as capture:

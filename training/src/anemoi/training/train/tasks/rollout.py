@@ -219,5 +219,3 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
             if self.rollout != old_rollout:
                 LOGGER.info("Rollout increased from %d to %d", old_rollout, self.rollout)
                 self.trainer.datamodule._rollout_shared_value.value = self.rollout
-                # Reset datasets to apply new rollout
-                self.trainer.datamodule.reset_datasets()

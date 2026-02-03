@@ -105,9 +105,20 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
         """Determine a list of relative time indices to load for each batch."""
         if hasattr(self.config.training, "explicit_times"):
             return sorted(set(self.config.training.explicit_times.input + self.config.training.explicit_times.target))
-    
-        # Use the rollout shared value
-        rollout_value = self._rollout_shared_value.value
+
+        # Calculate indices using multistep, timeincrement and rollout
+        rollout_cfg = getattr(getattr(self.config, "training", None), "rollout", None)
+
+        rollout_max = getattr(rollout_cfg, "max", None)
+        rollout_start = getattr(rollout_cfg, "start", 1)
+        rollout_epoch_increment = getattr(rollout_cfg, "epoch_increment", 0)
+
+        rollout_value = rollout_start
+        if rollout_cfg and rollout_epoch_increment > 0 and rollout_max is not None:
+            rollout_value = rollout_max
+        else:
+            LOGGER.warning("Falling back rollout to: %s", rollout_value)
+
         rollout = max(rollout_value, val_rollout)
         multi_step = self.config.training.multistep_input
         return list(range(multi_step + rollout))
@@ -170,6 +181,8 @@ class AnemoiDatasetsDataModule(pl.LightningDataModule):
             shuffle=shuffle,
             grid_indices=self.grid_indices,
             label=label,
+            rollout_shared_value=self._rollout_shared_value,
+            multi_step=self.config.training.multistep_input,
         )
 
     def _get_dataloader(self, ds: MultiDataset, stage: str) -> DataLoader:
