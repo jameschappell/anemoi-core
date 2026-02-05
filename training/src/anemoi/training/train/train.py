@@ -15,6 +15,7 @@ from abc import abstractmethod
 from functools import cached_property
 from pathlib import Path
 from typing import Any
+import os
 
 import hydra
 import numpy as np
@@ -145,13 +146,34 @@ class AnemoiTrainer(ABC):
         """Create graph for a specific dataset, overriding the dataset path in config."""
         # Determine filename
         if (graph_filename := self.config.system.input.graph) is not None:
-            graph_filename = Path(graph_filename)
+            original_graph_filename = Path(graph_filename)
+            graph_filename = original_graph_filename
+            LOGGER.info("Original graph filename: %s", original_graph_filename)
+            
             if graph_filename.name.endswith(".pt"):
+                # Try dataset-specific filename first
                 graph_name = graph_filename.name.replace(".pt", f"_{dataset_name}.pt")
-                graph_filename = graph_filename.parent / graph_name
+                dataset_specific_filename = graph_filename.parent / graph_name
+                
+                # Check which file exists and should be loaded
+                if dataset_specific_filename.exists():
+                    graph_filename = dataset_specific_filename
+                elif original_graph_filename.exists():
+                    # Use original file if it exists
+                    graph_filename = original_graph_filename
+                else:
+                    # Neither exists, use dataset-specific for creation
+                    graph_filename = dataset_specific_filename
+                    
+                LOGGER.info("Using graph filename: %s", graph_filename)
+
 
             # Try loading existing
-            if graph_filename.exists() and not self.config.graph.overwrite:
+            LOGGER.info("Checking for existing graph data at %s", graph_filename)
+            LOGGER.info(f"{graph_filename.exists()=}")
+            LOGGER.info(f"{os.path.isfile(graph_filename)=}")
+            LOGGER.info(f"{self.config.graph.overwrite=}")
+            if os.path.isfile(graph_filename) and not self.config.graph.overwrite:
                 from anemoi.graphs.utils import get_distributed_device
 
                 LOGGER.info("Loading graph data from %s", graph_filename)
@@ -172,7 +194,7 @@ class AnemoiTrainer(ABC):
             save_path=graph_filename,
             overwrite=self.config.graph.overwrite,
         )
-
+        
     @cached_property
     @abstractmethod
     def profiler(self) -> None:
@@ -241,8 +263,14 @@ class AnemoiTrainer(ABC):
 
             model.data_indices = self.data_indices
             # check data indices in original checkpoint and current data indices are the same
-            for data_indices in self.data_indices.values():
-                data_indices.compare_variables(model._ckpt_model_name_to_index, data_indices.name_to_index)
+            for dataset_name, data_indices in self.data_indices.items():
+                # Get the checkpoint's name_to_index for this specific dataset
+                ckpt_name_to_index = (
+                    model._ckpt_model_name_to_index.get(dataset_name)
+                    if isinstance(model._ckpt_model_name_to_index, dict)
+                    else model._ckpt_model_name_to_index
+                )
+                data_indices.compare_variables(ckpt_name_to_index, data_indices.name_to_index)
 
         if hasattr(self.config.training, "submodules_to_freeze"):
             # Freeze the chosen model weights
