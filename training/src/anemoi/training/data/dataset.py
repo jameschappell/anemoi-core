@@ -34,8 +34,18 @@ class BaseAnemoiReader:
         end: datetime.datetime | int | None = None,
         frequency: str | None = None,
         drop: list[str] | None = None,
+        select: list[str] | None = None,
     ):
-        self.data = open_dataset(dataset, start=start, end=end, frequency=frequency, drop=drop)
+        ds_kwargs = {}
+        
+        if drop is not None:
+            ds_kwargs["drop"] = drop
+        if select is not None:
+            ds_kwargs["select"] = select
+        if frequency is not None:
+            ds_kwargs["frequency"] = frequency
+        
+        self.data = open_dataset(dataset, start=start, end=end, **ds_kwargs)
 
     @property
     def dates(self) -> list[datetime.datetime]:
