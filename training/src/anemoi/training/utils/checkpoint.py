@@ -106,9 +106,16 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
     # Handle both single-dataset and multi-dataset checkpoints
     try:
         # Try multi-dataset format first
-        model._ckpt_model_name_to_index = checkpoint["hyper_parameters"]["data_indices"]["data"].name_to_index
+        data_indices = checkpoint["hyper_parameters"]["data_indices"]
+        if isinstance(data_indices, dict):
+            model._ckpt_model_name_to_index = {
+                dataset_name: indices.name_to_index
+                for dataset_name, indices in data_indices.items()
+            }
+        else:
+            model._ckpt_model_name_to_index = data_indices.name_to_index
     except (KeyError, AttributeError):
-        # Fall back to single-dataset format
+        # Fall back to single-dataset format for older checkpoints
         model._ckpt_model_name_to_index = checkpoint["hyper_parameters"]["data_indices"].name_to_index
     return model
 
