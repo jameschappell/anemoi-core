@@ -18,7 +18,7 @@ from omegaconf import DictConfig
 from anemoi.training.losses.base import BaseLoss
 from anemoi.training.losses.loss import get_loss_function
 from anemoi.training.losses.scaler_tensor import ScaleTensor
-
+from anemoi.models.data_indices.collection import IndexCollection
 
 class CombinedLoss(BaseLoss):
     """Combined Loss function."""
@@ -137,6 +137,24 @@ class CombinedLoss(BaseLoss):
             self.add_module(str(i), self.losses[-1])  # (self.losses[-1].name + str(i), self.losses[-1])
         self.loss_weights = loss_weights
         del self.scaler  # Remove scaler property from parent class, as it is not used here
+
+    @property
+    def scaler(self):
+        """Return the first loss's scaler for compatibility with plotting code."""
+        # Return first loss's scaler if available, otherwise return None
+        if self.losses and hasattr(self.losses[0], 'scaler'):
+            return self.losses[0].scaler
+        return None
+    
+    def set_data_indices(self, data_indices: IndexCollection) -> None:
+        for loss in self.losses:
+            if hasattr(loss, "set_data_indices"):
+                loss.set_data_indices(data_indices)
+                
+    def set_statistics(self, statistics: dict) -> None:
+        for loss in self.losses:
+            if hasattr(loss, "set_statistics"):
+                loss.set_statistics(statistics)
 
     def forward(
         self,
