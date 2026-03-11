@@ -174,9 +174,11 @@ class AnemoiTrainer(ABC):
             overwrite=self.config.graph.overwrite,
         )
 
+    # ...existing code...
     def _validate_transfer_learning_datasets(
         self,
         model: pl.LightningModule,
+        dataset_remapping: dict[str, str] | None = None,
     ) -> None:
         """Validate dataset compatibility between checkpoint and config for transfer learning.
 
@@ -195,6 +197,18 @@ class AnemoiTrainer(ABC):
         - **Scenario 4**: Swapping datasets (combination of scenarios 2 and 3)
           Some datasets are added (randomly initialized), others are removed (ignored).
 
+        - **Scenario 5**: Remapping datasets (checkpoint dataset name -> config dataset name)
+          e.g. checkpoint has 'data', config has 'era5' and 'ukv'.
+          Pass dataset_remapping={'data': 'era5'} to load 'data' weights into 'era5' layers.
+
+        Parameters
+        ----------
+        model : pl.LightningModule
+            The model instance.
+        dataset_remapping : dict[str, str] | None
+            Optional mapping from checkpoint dataset names to config dataset names.
+            e.g. {'data': 'era5'} will treat checkpoint 'data' weights as 'era5'.
+
         -----
         - Logs warnings for datasets that are missing or ignored
         - Logs info summary of loaded and initialized datasets
@@ -207,12 +221,26 @@ class AnemoiTrainer(ABC):
         if not isinstance(model._ckpt_model_name_to_index, dict):
             return
 
+        # Apply remapping: build a view of the checkpoint index with remapped names
+        ckpt_name_to_index = model._ckpt_model_name_to_index
+        if dataset_remapping:
+            remapped_ckpt = {}
+            for ckpt_name, index in ckpt_name_to_index.items():
+                mapped_name = dataset_remapping.get(ckpt_name, ckpt_name)
+                remapped_ckpt[mapped_name] = index
+                if ckpt_name != mapped_name:
+                    LOGGER.info(
+                        "Remapping checkpoint dataset '%s' -> '%s'.",
+                        ckpt_name,
+                        mapped_name,
+                    )
+            ckpt_name_to_index = remapped_ckpt
+
         # Validate each dataset in current config against checkpoint
         for dataset_name, data_indices in self.data_indices.items():
-            if dataset_name in model._ckpt_model_name_to_index:
+            if dataset_name in ckpt_name_to_index:
                 # Dataset found in checkpoint - validate variables match
-                ckpt_name_to_index = model._ckpt_model_name_to_index[dataset_name]
-                data_indices.compare_variables(ckpt_name_to_index, data_indices.name_to_index)
+                data_indices.compare_variables(ckpt_name_to_index[dataset_name], data_indices.name_to_index)
                 loaded_datasets.append(dataset_name)
             else:
                 # Dataset not found in checkpoint - will be randomly initialized
@@ -222,8 +250,8 @@ class AnemoiTrainer(ABC):
                 )
                 initialized_datasets.append(dataset_name)
 
-        # Check for datasets in checkpoint but not in config
-        ignored_datasets = [name for name in model._ckpt_model_name_to_index if name not in self.data_indices]
+        # Check for datasets in checkpoint but not in config (after remapping)
+        ignored_datasets = [name for name in ckpt_name_to_index if name not in self.data_indices]
         if ignored_datasets:
             for ignored_dataset in ignored_datasets:
                 LOGGER.warning(
@@ -270,13 +298,16 @@ class AnemoiTrainer(ABC):
 
         model_task = get_class(self.config.training.model_task)
         model = model_task(**kwargs)  # GraphForecaster -> pl.LightningModule
+        
+        # Check for dataset remapping
+        dataset_remapping = self.config.training.get("dataset_remapping", None)
 
         # Load the model weights
         if self.load_weights_only:
             # Sanify the checkpoint for transfer learning
             if self.config.training.transfer_learning:
                 LOGGER.info("Loading weights with Transfer Learning from %s", self.last_checkpoint)
-                model = transfer_learning_loading(model, self.last_checkpoint)
+                model = transfer_learning_loading(model, self.last_checkpoint, dataset_remapping)
             else:
                 LOGGER.info("Restoring only model weights from %s", self.last_checkpoint)
                 # pop data_indices so that the data indices on the checkpoint do not get overwritten
@@ -291,7 +322,7 @@ class AnemoiTrainer(ABC):
 
             model.data_indices = self.data_indices
             # Validate data indices between checkpoint and current config
-            self._validate_transfer_learning_datasets(model)
+            self._validate_transfer_learning_datasets(model, dataset_remapping)
 
         if hasattr(self.config.training, "submodules_to_freeze"):
             # Freeze the chosen model weights

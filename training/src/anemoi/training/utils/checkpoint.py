@@ -79,7 +79,86 @@ def save_inference_checkpoint(model: torch.nn.Module, metadata: dict, save_path:
     return inference_filepath
 
 
-def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> nn.Module:
+def remap_checkpoint_dataset(
+    state_dict: dict,
+    dataset_remapping: dict[str, str],
+) -> dict:
+    """Remap dataset names in a checkpoint state_dict.
+
+    Handles renaming dataset-specific layers (encoders, decoders,
+    pre/post processors, node attributes) from old to new dataset names.
+
+    Parameters
+    ----------
+    state_dict : dict
+        The checkpoint state dict to remap.
+    dataset_remapping : dict[str, str]
+        Mapping from old dataset name to new dataset name.
+        e.g. {'data': 'era5'} renames all 'data' layers to 'era5'.
+
+    Returns
+    -------
+    dict
+        Remapped state dict.
+    """
+    # Dataset-specific layer prefixes to remap
+    dataset_prefixes = [
+        "model.pre_processors.",
+        "model.post_processors.",
+        "model.pre_processors_tendencies.",
+        "model.post_processors_tendencies.",
+        "model.model.encoder.",
+        "model.model.encoder_graph_provider",
+        "model.model.decoder.",
+        "model.model.decoder_graph_provider",
+        "model.model.node_attributes.",
+    ]
+
+    remapped, unchanged = {}, []
+    rule_hits: dict[str, int] = {}
+    new_state_dict = {}
+
+    for old_key, value in state_dict.items():
+        new_key = old_key
+
+        for prefix in dataset_prefixes:
+            for old_name, new_name in dataset_remapping.items():
+                pattern = f"{prefix}{old_name}."
+                replacement = f"{prefix}{new_name}."
+                if pattern in new_key:
+                    new_key = new_key.replace(pattern, replacement)
+                    rule_hits[f"{pattern} -> {replacement}"] = rule_hits.get(f"{pattern} -> {replacement}", 0) + 1
+                    break  # only one dataset name can match per prefix
+
+        if new_key != old_key:
+            remapped[old_key] = new_key
+        else:
+            unchanged.append(old_key)
+
+        new_state_dict[new_key] = value
+
+    # Summary logging
+    LOGGER.info(
+        "Checkpoint dataset remapping: %d keys remapped, %d unchanged (of %d total).",
+        len(remapped),
+        len(unchanged),
+        len(state_dict),
+    )
+    for rule, count in rule_hits.items():
+        LOGGER.info("  %s: %d keys", rule, count)
+
+    LOGGER.debug("Example remapped keys (up to 10):")
+    for old_k, new_k in list(remapped.items())[:10]:
+        LOGGER.debug("  %s -> %s", old_k, new_k)
+
+    return new_state_dict
+
+
+def transfer_learning_loading(
+    model: torch.nn.Module, 
+    ckpt_path: Path | str,
+    dataset_remapping: dict[str, str] | None = None,
+) -> nn.Module:
     # Load the checkpoint
     LOGGER.debug("Loading checkpoint to device: %s", model.device)
     checkpoint = torch.load(ckpt_path, weights_only=False, map_location=model.device)
@@ -93,6 +172,11 @@ def transfer_learning_loading(model: torch.nn.Module, ckpt_path: Path | str) -> 
 
     # Filter out layers with size mismatch
     state_dict = checkpoint["state_dict"]
+    
+    # Remap dataset names in state_dict before loading
+    if dataset_remapping:
+        LOGGER.info("Applying dataset remapping: %s", dataset_remapping)
+        state_dict = remap_checkpoint_dataset(state_dict, dataset_remapping)
 
     model_state_dict = model.state_dict()
 
