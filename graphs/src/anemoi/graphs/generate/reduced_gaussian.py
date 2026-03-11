@@ -1,7 +1,9 @@
 import logging
+import re
 
 import numpy as np
 import torch
+from requests.exceptions import HTTPError
 
 from anemoi.graphs.generate.masks import KNNAreaMaskBuilder
 from anemoi.graphs.generate.utils import get_coordinates_ordering
@@ -17,16 +19,58 @@ def get_latlon_coords_gaussian(grid: str) -> np.ndarray:
     ----------
     grid : str
         The reduced gaussian grid identifier, e.g. 'O96', 'N320'.
+        If the grid is not found in the registry and starts with 'O',
+        falls back to generating it locally via reduced_gaussian_gridpoints().
 
     Returns
     -------
     np.ndarray of shape (num_nodes, 2)
         The latitude and longitude coordinates, in radians.
     """
-    grid_data = grids(grid)
-    lats = np.deg2rad(grid_data["latitudes"])
-    lons = np.deg2rad(grid_data["longitudes"])
+    try:
+        grid_data = grids(grid)
+        lats = np.deg2rad(grid_data["latitudes"])
+        lons = np.deg2rad(grid_data["longitudes"])
+    except HTTPError:
+        if not re.match(r"^[Oo]\d+$", grid):
+            raise ValueError(f"Grid '{grid}' not found in registry and does not match expected format 'O{{n_points}}'.")
+        n_points = int(re.match(r"^[Oo](\d+)$", grid).group(1))
+        LOGGER.warning(
+            "Grid '%s' not found in registry. Falling back to  octahedral_reduced_gaussian_gridpoints(n_points=%d).",
+            grid,
+            n_points,
+        )
+        lats_deg, lons_deg = octahedral_reduced_gaussian_gridpoints(n_points=n_points)
+        lats = np.deg2rad(lats_deg)
+        lons = np.deg2rad(lons_deg)
+
     return np.stack([lats, lons], axis=-1)
+
+
+def octahedral_reduced_gaussian_gridpoints(n_points=96, dtype=np.float64):
+    """
+    Generate coordinates for the ECMWF octahedral reduced Gaussian grid.
+    """
+    N = n_points * 2
+
+    # Gaussian latitudes (north -> south)
+    x, _ = np.polynomial.legendre.leggauss(N)
+    gauss_lats = np.degrees(np.arcsin(x))[::-1].astype(dtype, copy=False)
+
+    # Number of longitudes per latitude (octahedral)
+    nlons_half = 16 + 4 * np.arange(1, N // 2 + 1)
+    nlons = np.concatenate([nlons_half, nlons_half[::-1]]).astype(np.int64, copy=False)
+
+    # Vectorized full coordinate arrays
+    lats = np.repeat(gauss_lats, nlons)
+
+    n_total = int(nlons.sum())
+    starts = np.cumsum(np.r_[0, nlons[:-1]])      # start index per latitude ring
+    idx_in_ring = np.arange(n_total) - np.repeat(starts, nlons)
+    nlon_per_point = np.repeat(nlons, nlons)
+
+    lons = (idx_in_ring * (360.0 / nlon_per_point)).astype(dtype, copy=False)
+    return lats, lons
 
 
 def create_stretched_reduced_gaussian_nodes(
