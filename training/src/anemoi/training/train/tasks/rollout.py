@@ -16,6 +16,7 @@ from abc import abstractmethod
 from typing import TYPE_CHECKING
 
 import torch
+import gc
 
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.training.diagnostics.callbacks.plot_adapter import ForecasterPlotAdapter
@@ -228,3 +229,6 @@ class BaseRolloutGraphModule(BaseGraphModule, ABC):
             self.rollout += 1
             LOGGER.debug("Rollout window length: %d", self.rollout)
         self.rollout = min(self.rollout, self.rollout_max)
+        
+        # attempt to free up memory after each epoch
+        gc.collect()
