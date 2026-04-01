@@ -122,6 +122,12 @@ def create_stretched_reduced_gaussian_nodes(
     LOGGER.info("Total nodes after combining: %d.", len(combined_coords))
 
     # Sort by latitude and longitude, consistent with get_coordinates_ordering
-    node_ordering = get_coordinates_ordering(combined_coords)
+    node_ordering = get_coordinates_ordering_stable(combined_coords)
 
     return torch.tensor(combined_coords[node_ordering], dtype=torch.float32)
+
+def get_coordinates_ordering_stable(coords: np.ndarray) -> np.ndarray:
+    index_latitude = np.argsort(coords[:, 1])                      # sort by lon (secondary key)
+    index_longitude = np.argsort(-coords[index_latitude][:, 0], kind='stable')  # sort by lat desc (primary key)
+    node_ordering = np.arange(coords.shape[0])[index_latitude][index_longitude]
+    return node_ordering
