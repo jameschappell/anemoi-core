@@ -154,9 +154,27 @@ def remap_checkpoint_dataset(
     return new_state_dict
 
 
+def get_trainable_key(param_name: str) -> str | None:
+    """
+    Helper function used when transfer learning to identify changes in trainable_parameters numbers.
+    """
+    if ".encoder." in param_name:
+        return "data2hidden"
+    if ".decoder." in param_name:
+        return "hidden2data"
+    if ".processor." in param_name:
+        return "hidden2hidden"
+    if ".data." in param_name:
+        return "data"
+    if ".hidden." in param_name:
+        return "hidden"
+    return None
+
+
 def transfer_learning_loading(
     model: torch.nn.Module, 
     ckpt_path: Path | str,
+    model_config: dict,
     dataset_remapping: dict[str, str] | None = None,
 ) -> nn.Module:
     # Load the checkpoint
@@ -166,11 +184,15 @@ def transfer_learning_loading(
     # apply chunking migration (fails silently otherwise leading to hard to debug issues)
     # this is due to loading with strict=False, planning to make this more robust in the future
     checkpoint = chunking_fix_migration(checkpoint)
+    
+    # extract trainable_parameters dictionary from the model config
+    trainable_parameters = model_config.trainable_parameters
 
     # Refresh processor stats from the current dataset if configured.
     model._update_checkpoint_state_dict_for_load(checkpoint)
 
-    # Filter out layers with size mismatch
+    # check whether sizes of components are compatible, either matching or differing by 
+    # trainable_parameters
     state_dict = checkpoint["state_dict"]
     
     # Remap dataset names in state_dict before loading
@@ -179,14 +201,61 @@ def transfer_learning_loading(
         state_dict = remap_checkpoint_dataset(state_dict, dataset_remapping)
 
     model_state_dict = model.state_dict()
+    
+    for key in list(state_dict.keys()):
+        if key not in model_state_dict:
+            continue
 
-    for key in state_dict.copy():
-        if key in model_state_dict and state_dict[key].shape != model_state_dict[key].shape:
-            LOGGER.info("Skipping loading parameter: %s", key)
-            LOGGER.info("Checkpoint shape: %s", str(state_dict[key].shape))
-            LOGGER.info("Model shape: %s", str(model_state_dict[key].shape))
+        ckpt_tensor = state_dict[key]
+        model_tensor = model_state_dict[key]
 
-            del state_dict[key]  # Remove the mismatched key
+        if ckpt_tensor.shape == model_tensor.shape:
+            continue  # perfect match
+
+        if ckpt_tensor.ndim != model_tensor.ndim:
+            LOGGER.info("Skipping %s (different ndim)", key)
+            del state_dict[key]
+            continue
+
+        # check whether the size of the parameter grows by the number of trainable parameters
+        # if so, load it into the matching slice of the tensor
+        growth_key = get_trainable_key(key)
+        
+        if growth_key is None:          
+            LOGGER.info("Skipping %s (no growth rule)", key)
+            del state_dict[key]
+            continue
+        
+        allowed_growth = trainable_parameters.get(growth_key, None)
+
+        if allowed_growth is None:
+            LOGGER.info("Skipping %s (no growth rule)", key)
+            del state_dict[key]
+            continue
+
+        # compute per-dimension differences
+        diffs = [m - c for c, m in zip(ckpt_tensor.shape, model_tensor.shape)]
+
+        # only allow change in parameter size in ONE dimension equal to allowed_growth
+        # if checkpoint parameter has shape [num_channels, size], model has [num_channels, size + allowed_growth]
+        # then can load weights into first [num_channels, size] of the model weights 
+        # i.e. only the trainable_parameters are initialised from scratch
+        positive_diffs = [d for d in diffs if d > 0]
+
+        if positive_diffs == [allowed_growth] and all(d >= 0 for d in diffs):
+            LOGGER.info("Partially loading %s with allowed growth %d from key %s", key, allowed_growth, growth_key)
+            LOGGER.info("Checkpoint shape: %s", tuple(ckpt_tensor.shape))
+            LOGGER.info("Model shape: %s", tuple(model_tensor.shape))
+
+            new_tensor = model_tensor.clone()
+            slices = tuple(slice(0, min(c, m)) for c, m in zip(ckpt_tensor.shape, model_tensor.shape))
+            new_tensor[slices] = ckpt_tensor[slices]
+            state_dict[key] = new_tensor
+        else:
+            LOGGER.info("Skipping %s (shape change not matching config)", key)
+            LOGGER.info("Checkpoint shape: %s", tuple(ckpt_tensor.shape))
+            LOGGER.info("Model shape: %s", tuple(model_tensor.shape))
+            del state_dict[key]
 
     # Load the filtered st-ate_dict into the model
     model.load_state_dict(state_dict, strict=False)
