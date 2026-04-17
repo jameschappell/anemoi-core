@@ -24,6 +24,7 @@ from .spectral import SpectralCRPSLoss
 from .spectral import SpectralL2Loss
 from .variable_mapper import LossVariableMapper
 from .weighted_mse import WeightedMSELoss
+from .amse import ReducedGaussianMSHLoss, LatLonMSHLoss, RegionalFFTLoss
 
 __all__ = [
     "AlmostFairKernelCRPS",
@@ -42,5 +43,8 @@ __all__ = [
     "SpectralCRPSLoss",
     "SpectralL2Loss",
     "WeightedMSELoss",
+    "ReducedGaussianMSHLoss",
+    "LatLonMSHLoss",
+    "RegionalFFTLoss",
     "get_loss_function",
 ]
