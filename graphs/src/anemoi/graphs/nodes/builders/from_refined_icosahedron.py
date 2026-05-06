@@ -187,6 +187,7 @@ class StretchedIcosahedronNodes(LimitedAreaIcosahedralNodes, ABC):
             name=name,
         )
         self.global_resolution = global_resolution
+        self.hidden_attributes = self.hidden_attributes | {"global_resolution"}
 
 
 class StretchedTriNodes(StretchedIcosahedronNodes):

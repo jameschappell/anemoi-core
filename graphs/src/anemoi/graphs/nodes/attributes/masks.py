@@ -182,3 +182,28 @@ class LimitedAreaMask(BooleanBaseNodeAttribute):
         ], f"{self.__class__.__name__} can only be used with StretchedIcosahedronNodes."
         lam_mask = nodes["_area_mask_builder"].get_mask(nodes.x)
         return torch.from_numpy(lam_mask)
+    
+
+class GlobalResolutionMask(BooleanBaseNodeAttribute):
+    """Mask of nodes that exist at global_resolution, including those inside the LAM region."""
+
+    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
+        assert nodes["node_type"] == "StretchedTriNodes"
+        from anemoi.graphs.generate.tri_icosahedron import get_latlon_coords_icosphere
+        from sklearn.neighbors import BallTree
+        import numpy as np
+
+        global_res = nodes["_global_resolution"]  # stored by StretchedIcosahedronNodes
+        global_coords = get_latlon_coords_icosphere(global_res)
+
+        hidden_coords = nodes.x.cpu().numpy()  # shape (N, 2), lat/lon in radians
+        tree = BallTree(hidden_coords, metric="haversine")
+        # query each global-res coord — if distance ~ 0, it exists in hidden nodes
+        distances, _ = tree.query(global_coords, k=1)
+        matched_global = global_coords[distances[:, 0] < 1e-6]  # tight tolerance
+
+        # Now find which hidden node indices correspond to these coords
+        distances2, indices = tree.query(matched_global, k=1)
+        mask = torch.zeros(len(hidden_coords), dtype=torch.bool)
+        mask[indices[:, 0]] = True
+        return mask
