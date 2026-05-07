@@ -41,6 +41,7 @@ class BaseLoss(nn.Module, ABC):
     # extra inputs they need from get_loss_function() here.
     factory_context_keys: ClassVar[frozenset[LossFactoryContextKey | str]] = frozenset()
     scaler: ScaleTensor
+    needs_graph_data: bool = False
 
     def __init__(
         self,
@@ -89,7 +90,7 @@ class BaseLoss(nn.Module, ABC):
     @functools.wraps(ScaleTensor.has_scaler_for_dim)
     def has_scaler_for_dim(self, dim: TensorDim) -> bool:
         return self.scaler.has_scaler_for_dim(dim=dim)
-        
+
     def set_statistics(self, statistics: dict) -> None:
         """Hook to set the statistics for the loss."""
 

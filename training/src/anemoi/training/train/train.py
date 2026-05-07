@@ -29,8 +29,15 @@ from pytorch_lightning.loggers.logger import Logger
 from pytorch_lightning.utilities.rank_zero import rank_zero_only
 from torch_geometric.data import HeteroData
 
+from anemoi.graphs.create import GraphCreator
+from anemoi.graphs.create import load_graph_from_file
+from anemoi.graphs.create import validate_loaded_graph
+from anemoi.graphs.projection_helpers import DEFAULT_DATASET_NAME
+from anemoi.graphs.projection_helpers import uses_fused_dataset_graph
 from anemoi.models.utils.compile import mark_for_compilation
+from anemoi.models.utils.config import get_multiple_datasets_config
 from anemoi.training.data.datamodule import AnemoiDatasetsDataModule
+from anemoi.training.diagnostics.callbacks import CallbacksContext
 from anemoi.training.diagnostics.callbacks import get_callbacks
 from anemoi.training.diagnostics.logger import get_mlflow_logger
 from anemoi.training.diagnostics.logger import get_wandb_logger
@@ -167,30 +174,116 @@ class AnemoiTrainer(ABC):
         return None
 
     @cached_property
+    def _dataset_names(self) -> list[str]:
+        """Dataset names derived from the dataloader training config."""
+        return list(get_multiple_datasets_config(self.config.dataloader.training).keys())
+
+    @cached_property
     def graph_data(self) -> HeteroData:
-        """Graph data. Always uses dataset paths from dataloader config."""
-        # Determine filename
-        if (graph_filename := self.config.system.input.graph) is not None:
-            graph_filename = Path(graph_filename)
+        """Graph data built or loaded for the current trainer config."""
+        dataset_names = self._dataset_names
+        graph_cfg = self.config.graph
+        graph_path = self.config.system.input.graph
+        save_path = Path(graph_path) if graph_path else None
 
-            # Try loading existing
-            if graph_filename.exists() and not self.config.graph.overwrite:
-                from anemoi.graphs.utils import get_distributed_device
-
-                LOGGER.info("Loading graph data from %s", graph_filename)
-                return torch.load(graph_filename, map_location=get_distributed_device(), weights_only=False)
-
-            # TODO(): We could add some functionality to load partial graphs here, and compute the rest from the config.
-        else:
-            graph_filename = None
-
-        # Create new graph
-        from anemoi.graphs.create import GraphCreator
-
-        return GraphCreator(config=self.config.graph).create(
-            save_path=graph_filename,
-            overwrite=self.config.graph.overwrite,
+        # Existing-graph mode: path given but no nodes/edges defined — load as-is.
+        is_existing = (
+            graph_path is not None
+            and not graph_cfg.overwrite
+            and not getattr(graph_cfg, "nodes", None)
+            and not getattr(graph_cfg, "edges", None)
         )
+        if is_existing:
+            if not save_path.exists():
+                msg = f"Existing graph file not found: {save_path}"
+                raise FileNotFoundError(msg)
+            graph = load_graph_from_file(save_path)
+            fused = uses_fused_dataset_graph(graph, dataset_names)
+            required = dataset_names if fused else [DEFAULT_DATASET_NAME]
+            validate_loaded_graph(graph, required)
+            return graph
+
+        # Build mode: expand config and create graph via GraphCreator.
+        graph_config = OmegaConf.create(OmegaConf.to_container(graph_cfg, resolve=False))
+
+        if not uses_fused_dataset_graph(graph_cfg, dataset_names):
+            if len(dataset_names) == 1:
+                dataset_configs = get_multiple_datasets_config(self.config.dataloader.training)
+                dataset_name = dataset_names[0]
+                reader_cfg = dataset_configs[dataset_name].dataset_config
+                dataset_path = reader_cfg["dataset"] if isinstance(reader_cfg, (DictConfig, dict)) else reader_cfg
+                if dataset_path is None:
+                    msg = f"Dataset source is None for dataset '{dataset_name}'."
+                    raise ValueError(msg)
+                data_node_cfg = graph_config.get("nodes", {}).get(DEFAULT_DATASET_NAME)
+                if (
+                    data_node_cfg is not None
+                    and hasattr(data_node_cfg, "node_builder")
+                    and hasattr(data_node_cfg.node_builder, "dataset")
+                ):
+                    data_node_cfg.node_builder.dataset = dataset_path
+            else:
+                msg = (
+                    "Multiple datasets require a fused graph config with one node group per dataset. "
+                    f"Received datasets {dataset_names} but graph nodes "
+                    f"{list(graph_cfg.nodes.keys())}."
+                )
+                raise ValueError(msg)
+
+        # Try loading existing saved graph before rebuilding.
+        overwrite = graph_cfg.get("overwrite", False)
+        if save_path and save_path.exists() and not overwrite:
+            fused = uses_fused_dataset_graph(graph_cfg, dataset_names)
+            required = dataset_names if fused else [DEFAULT_DATASET_NAME]
+            graph = load_graph_from_file(save_path)
+            validate_loaded_graph(graph, required)
+            return graph
+
+        return GraphCreator(graph_config).create(save_path=save_path, overwrite=overwrite)
+
+    def _apply_dataset_remapping(
+        self,
+        ckpt_name_to_index: dict,
+        dataset_remapping: dict[str, str],
+    ) -> dict:
+        """Apply name remapping to the checkpoint dataset index.
+
+        Parameters
+        ----------
+        ckpt_name_to_index : dict
+            Mapping from checkpoint dataset names to their stored index objects.
+        dataset_remapping : dict[str, str]
+            Mapping from checkpoint dataset names to config dataset names.
+
+        Returns
+        -------
+        dict
+            A new index dict with checkpoint names replaced by their mapped names.
+        """
+        remapped = {}
+        for ckpt_name, index in ckpt_name_to_index.items():
+            mapped_name = dataset_remapping.get(ckpt_name, ckpt_name)
+            remapped[mapped_name] = index
+            if ckpt_name != mapped_name:
+                LOGGER.info("Remapping checkpoint dataset '%s' -> '%s'.", ckpt_name, mapped_name)
+        return remapped
+
+    def _check_ignored_datasets(self, ckpt_name_to_index: dict) -> None:
+        """Warn about checkpoint datasets that are absent from the current config.
+
+        Parameters
+        ----------
+        ckpt_name_to_index : dict
+            Mapping from (possibly remapped) checkpoint dataset names to their index.
+        """
+        for name in ckpt_name_to_index:
+            if name not in self.data_indices:
+                LOGGER.warning(
+                    "Dataset '%s' found in checkpoint but NOT in config. "
+                    "Encoder & decoder weights for '%s' will be ignored.",
+                    name,
+                    name,
+                )
 
     def _validate_transfer_learning_datasets(
         self,
@@ -202,21 +295,21 @@ class AnemoiTrainer(ABC):
         This method handles multiple transfer learning scenarios when loading a checkpoint:
 
         - **Scenario 1**: Exact match (checkpoint datasets == config datasets)
-          All weights are loaded normally.
+        All weights are loaded normally.
 
         - **Scenario 2**: Adding datasets (config has datasets not in checkpoint)
-          Missing datasets will have their encoder & decoder weights randomly initialized.
-          The shared processor weights are still transferred.
+        Missing datasets will have their encoder & decoder weights randomly initialized.
+        The shared processor weights are still transferred.
 
         - **Scenario 3**: Removing datasets (checkpoint has datasets not in config)
-          Extra datasets in checkpoint are ignored (their weights are not loaded).
+        Extra datasets in checkpoint are ignored (their weights are not loaded).
 
         - **Scenario 4**: Swapping datasets (combination of scenarios 2 and 3)
-          Some datasets are added (randomly initialized), others are removed (ignored).
+        Some datasets are added (randomly initialized), others are removed (ignored).
 
         - **Scenario 5**: Remapping datasets (checkpoint dataset name -> config dataset name)
-          e.g. checkpoint has 'data', config has 'era5' and 'ukv'.
-          Pass dataset_remapping={'data': 'era5'} to load 'data' weights into 'era5' layers.
+        e.g. checkpoint has 'data', config has 'era5' and 'ukv'.
+        Pass dataset_remapping={'data': 'era5'} to load 'data' weights into 'era5' layers.
 
         Parameters
         ----------
@@ -226,59 +319,35 @@ class AnemoiTrainer(ABC):
             Optional mapping from checkpoint dataset names to config dataset names.
             e.g. {'data': 'era5'} will treat checkpoint 'data' weights as 'era5'.
 
+        Notes
         -----
         - Logs warnings for datasets that are missing or ignored
         - Logs info summary of loaded and initialized datasets
         - The shared processor weights are always transferred
         """
-        loaded_datasets = []
-        initialized_datasets = []
-
-        # Check if checkpoint has multi-dataset format
         if not isinstance(model._ckpt_model_name_to_index, dict):
             return
 
-        # Apply remapping: build a view of the checkpoint index with remapped names
         ckpt_name_to_index = model._ckpt_model_name_to_index
         if dataset_remapping:
-            remapped_ckpt = {}
-            for ckpt_name, index in ckpt_name_to_index.items():
-                mapped_name = dataset_remapping.get(ckpt_name, ckpt_name)
-                remapped_ckpt[mapped_name] = index
-                if ckpt_name != mapped_name:
-                    LOGGER.info(
-                        "Remapping checkpoint dataset '%s' -> '%s'.",
-                        ckpt_name,
-                        mapped_name,
-                    )
-            ckpt_name_to_index = remapped_ckpt
+            ckpt_name_to_index = self._apply_dataset_remapping(ckpt_name_to_index, dataset_remapping)
 
-        # Validate each dataset in current config against checkpoint
+        loaded_datasets = []
+        initialized_datasets = []
+
         for dataset_name, data_indices in self.data_indices.items():
             if dataset_name in ckpt_name_to_index:
-                # Dataset found in checkpoint - validate variables match
                 data_indices.compare_variables(ckpt_name_to_index[dataset_name], data_indices.name_to_index)
                 loaded_datasets.append(dataset_name)
             else:
-                # Dataset not found in checkpoint - will be randomly initialized
                 LOGGER.warning(
                     "Dataset '%s' NOT found in checkpoint. Encoder & decoder weights will be randomly initialized!",
                     dataset_name,
                 )
                 initialized_datasets.append(dataset_name)
 
-        # Check for datasets in checkpoint but not in config (after remapping)
-        ignored_datasets = [name for name in ckpt_name_to_index if name not in self.data_indices]
-        if ignored_datasets:
-            for ignored_dataset in ignored_datasets:
-                LOGGER.warning(
-                    "Dataset '%s' found in checkpoint but NOT in config. "
-                    "Encoder & decoder weights for '%s' will be ignored.",
-                    ignored_dataset,
-                    ignored_dataset,
-                )
+        self._check_ignored_datasets(ckpt_name_to_index)
 
-        # Log summary of what was loaded
         if loaded_datasets:
             LOGGER.info("Successfully loaded weights for datasets: %s", loaded_datasets)
         if initialized_datasets:
@@ -317,7 +386,7 @@ class AnemoiTrainer(ABC):
 
         training_method = get_class(self.config.training.training_method)
         model = training_method(**kwargs)  # Task -> pl.LightningModule
-        
+
         # Check for dataset remapping
         dataset_remapping = self.config.training.get("dataset_remapping", None)
 
@@ -412,7 +481,15 @@ class AnemoiTrainer(ABC):
 
     @cached_property
     def callbacks(self) -> list[pl.callbacks.Callback]:
-        return get_callbacks(self.config)
+        callbacks_context = CallbacksContext(
+            diagnostics=self.config.diagnostics,
+            checkpoints_output=self.config.system.output.checkpoints,
+            plots_output=self.config.system.output.plots,
+            wandb_enabled=getattr(getattr(self.config.diagnostics.log, "wandb", None), "enabled", False),
+            mlflow_enabled=getattr(getattr(self.config.diagnostics.log, "mlflow", None), "enabled", False),
+            weight_averaging_config=getattr(self.config.training, "weight_averaging", None),
+        )
+        return get_callbacks(callbacks_context)
 
     @cached_property
     def metadata(self) -> dict:

@@ -23,11 +23,12 @@ from anemoi.training.losses.loss import get_loss_function
 from anemoi.training.losses.scaler_tensor import TENSOR_SPEC
 from anemoi.training.losses.scaler_tensor import ScaleTensor
 from anemoi.training.utils.enums import TensorDim
-from anemoi.models.data_indices.collection import IndexCollection
+
 
 class CombinedLoss(BaseLoss):
     """Combined Loss function."""
 
+    needs_graph_data: bool = True
     # CombinedLoss builds child losses itself, so it needs the filtered scaler
     # set and data indices during construction.
     factory_context_keys = frozenset(
@@ -180,7 +181,7 @@ class CombinedLoss(BaseLoss):
 
         filtered_kwargs = dict(kwargs)
         filtered_kwargs.pop("grid_dim", None)
-        filtered_kwargs.pop("grid_shard_shapes", None)
+        filtered_kwargs.pop("grid_shard_sizes", None)
         return filtered_kwargs
 
     def iter_leaf_losses(self) -> Iterator["BaseLoss"]:
@@ -188,19 +189,11 @@ class CombinedLoss(BaseLoss):
         for sub_loss in self.losses:
             yield from sub_loss.iter_leaf_losses()
 
-    # @property
-    # def scaler(self):
-    #     """Return the first loss's scaler for compatibility with plotting code."""
-    #     # Return first loss's scaler if available, otherwise return None
-    #     if self.losses and hasattr(self.losses[0], 'scaler'):
-    #         return self.losses[0].scaler
-    #     return None
-    
     def set_data_indices(self, data_indices: IndexCollection) -> None:
         for loss in self.losses:
             if hasattr(loss, "set_data_indices"):
                 loss.set_data_indices(data_indices)
-                
+
     def set_statistics(self, statistics: dict) -> None:
         for loss in self.losses:
             if hasattr(loss, "set_statistics"):
