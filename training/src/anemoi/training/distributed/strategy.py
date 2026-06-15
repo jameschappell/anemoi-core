@@ -16,6 +16,7 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.strategies.ddp import DDPStrategy
 
+from anemoi.models.distributed.balanced_partition import get_balanced_partition_sizes
 from anemoi.training.distributed.groups import build_ensemble_layout
 from anemoi.training.distributed.groups import build_model_layout
 from anemoi.training.distributed.groups import build_reader_layout
@@ -114,6 +115,26 @@ class BaseDDPStrategy(DDPStrategy):
         """
         raise NotImplementedError
 
+    @staticmethod
+    def _get_reader_shard_sizes(
+        dataloader: torch.utils.data.DataLoader,
+        read_group_size: int,
+    ) -> dict[str, list[int]]:
+        data_readers = getattr(dataloader.dataset, "data_readers", None)
+        if data_readers is None:
+            msg = "Expected dataloader.dataset to expose 'data_readers'."
+            raise AttributeError(msg)
+
+        return {
+            dataset_name: get_balanced_partition_sizes(reader.grid_size, read_group_size)
+            for dataset_name, reader in data_readers.items()
+        }
+
+    def _set_model_reader_shard_sizes(self, reader_shard_sizes: dict[str, list[int]]) -> None:
+        model_module = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model_module, "set_reader_shard_sizes"):
+            model_module.set_reader_shard_sizes(reader_shard_sizes)
+
     def setup(self, trainer: pl.Trainer) -> None:
         model_comm_group_id = self._setup_communication_groups()
 
@@ -207,22 +228,8 @@ class DDPGroupStrategy(BaseDDPStrategy):
         return model_layout.model_comm_group_id
 
     def process_dataloader(self, dataloader: torch.utils.data.DataLoader) -> torch.utils.data.DataLoader:
-        """Pass communication group information to the dataloader for distributed training.
-
-        Parameters
-        ----------
-        dataloader : torch.utils.data.DataLoader
-            Dataloader to process.
-
-        Returns
-        -------
-        torch.utils.data.DataLoader
-            Processed dataloader.
-
-        """
         dataloader = super().process_dataloader(dataloader)
 
-        # pass model and reader group information to the dataloaders dataset
         model_comm_group_id, model_comm_group_rank, model_comm_num_groups = get_my_model_comm_group(
             self.model_comm_group_size,
             self.global_rank,
@@ -234,6 +241,8 @@ class DDPGroupStrategy(BaseDDPStrategy):
             self.global_rank,
         )
 
+        reader_shard_sizes = self._get_reader_shard_sizes(dataloader, self.read_group_size)
+
         dataloader.dataset.set_comm_group_info(
             self.global_rank,
             model_comm_group_id,
@@ -241,9 +250,10 @@ class DDPGroupStrategy(BaseDDPStrategy):
             model_comm_num_groups,
             reader_group_rank,
             self.read_group_size,
-            self.shard_sizes,
+            reader_shard_sizes,
         )
 
+        self._set_model_reader_shard_sizes(reader_shard_sizes)
         return dataloader
 
 
@@ -367,22 +377,8 @@ class DDPEnsGroupStrategy(BaseDDPStrategy):
         return model_layout.model_comm_group_id
 
     def process_dataloader(self, dataloader: torch.utils.data.DataLoader) -> torch.utils.data.DataLoader:
-        """Pass communication group information to the dataloader for distributed training.
-
-        Parameters
-        ----------
-        dataloader : torch.utils.data.DataLoader
-            Dataloader to process.
-
-        Returns
-        -------
-        torch.utils.data.DataLoader
-            Processed dataloader.
-
-        """
         dataloader = super().process_dataloader(dataloader)
 
-        # pass model and reader group information to the dataloaders dataset
         model_comm_group_id, model_comm_group_rank, model_comm_num_groups = get_my_model_comm_group(
             self.model_comm_group_size,
             self.global_rank,
@@ -399,6 +395,8 @@ class DDPEnsGroupStrategy(BaseDDPStrategy):
             self.world_size,
         )
 
+        reader_shard_sizes = self._get_reader_shard_sizes(dataloader, self.read_group_size)
+
         dataloader.dataset.set_comm_group_info(
             self.global_rank,
             model_comm_group_id,
@@ -406,7 +404,7 @@ class DDPEnsGroupStrategy(BaseDDPStrategy):
             model_comm_num_groups,
             reader_group_rank,
             self.read_group_size,
-            self.shard_sizes,
+            reader_shard_sizes,
         )
 
         dataloader.dataset.set_ens_comm_group_info(
@@ -415,4 +413,5 @@ class DDPEnsGroupStrategy(BaseDDPStrategy):
             ens_comm_num_groups,
         )
 
+        self._set_model_reader_shard_sizes(reader_shard_sizes)
         return dataloader

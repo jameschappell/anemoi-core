@@ -30,6 +30,7 @@ from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.distributed.balanced_partition import get_balanced_partition_sizes
 from anemoi.models.distributed.balanced_partition import get_partition_range
 from anemoi.models.distributed.graph import gather_tensor
+from anemoi.models.distributed.graph import shard_tensor
 from anemoi.models.interface import AnemoiModelInterface
 from anemoi.models.utils.config import get_multiple_datasets_config
 from anemoi.training.losses import get_loss_function
@@ -301,15 +302,19 @@ class BaseTrainingModule(pl.LightningModule, ABC):
 
         reader_group_size = self.config.dataloader.read_group_size
 
+        # Model-layout shard metadata (post-preprocessing, graph-sized)
         self.shard_sizes, self.grid_sizes = {}, {}
         for dataset_name in self.dataset_names:
-            self.grid_sizes[dataset_name] = graph_data[
-                dataset_name
-            ].num_nodes  # TODO(Mario): Replace by dataset.grid_size
+            self.grid_sizes[dataset_name] = graph_data[dataset_name].num_nodes
             self.shard_sizes[dataset_name] = get_balanced_partition_sizes(
                 self.grid_sizes[dataset_name],
                 reader_group_size,
             )
+
+        # Reader-layout shard metadata (pre-preprocessing, dataset-sized)
+        # Defaults to model layout and is overwritten by strategy.process_dataloader.
+        self.reader_shard_sizes = {name: list(sizes) for name, sizes in self.shard_sizes.items()}
+        self.reader_grid_sizes = {name: int(self.grid_sizes[name]) for name in self.dataset_names}
 
         self.grid_dim = -2
 
@@ -477,12 +482,18 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         if scaler is None:  # If scaler is None, no update to be applied
             return
 
+        updated = scaler[1]
+        if isinstance(updated, torch.Tensor):
+            if updated.layout == torch.strided:
+                updated = updated.clone(memory_format=torch.contiguous_format)
+            else:
+                updated = updated.clone()
         if self._can_update_scaler(loss_obj, name):
-            loss_obj.update_scaler(scaler=scaler[1], name=name)  # Only update the values
+            loss_obj.update_scaler(scaler=updated, name=name)  # Only update the values
 
         for metric in metrics_dict.values():  # If scalar in metrics, update it
             if self._can_update_scaler(metric, name):
-                metric.update_scaler(scaler=scaler[1], name=name)  # Only update the values
+                metric.update_scaler(scaler=updated, name=name)  # Only update the values
 
     @staticmethod
     def _can_update_scaler(loss_or_metric: torch.nn.Module, scaler_name: str) -> bool:
@@ -540,6 +551,10 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         self.reader_group_id = reader_group_id
         self.reader_group_rank = reader_group_rank
         self.reader_group_size = reader_group_size
+
+    def set_reader_shard_sizes(self, reader_shard_sizes: dict[str, list[int]]) -> None:
+        self.reader_shard_sizes = {name: list(sizes) for name, sizes in reader_shard_sizes.items()}
+        self.reader_grid_sizes = {name: int(sum(sizes)) for name, sizes in self.reader_shard_sizes.items()}
 
     def _prepare_tensors_for_loss(
         self,
@@ -810,37 +825,16 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         return batch
 
     def _setup_batch_sharding(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Setup batch sharding before every step.
-
-        If the batch is sharded, it will be setup with the grid shard sizes and slice.
-        Otherwise, the batch will be allgathered.
-
-        Parameters
-        ----------
-        batch : dict[str, torch.Tensor]
-            Batch to setup
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Batch after setup
-        """
         assert isinstance(batch, dict), "batch must be a dict keyed by dataset name"
         self.grid_shard_sizes = {}
         self.grid_shard_slice = {}
 
+        # Stage 1: reconstruct full reader-layout tensors before preprocessing.
         for dataset_name in self.dataset_names:
-            if self.keep_batch_sharded and self.model_comm_group_size > 1:
-                self.grid_shard_sizes[dataset_name] = self.shard_sizes[dataset_name]
-                start, end = get_partition_range(
-                    partition_sizes=self.grid_shard_sizes[dataset_name],
-                    partition_id=self.reader_group_rank,
-                )
-                self.grid_shard_slice[dataset_name] = slice(start, end)
-            else:
-                self.grid_shard_sizes[dataset_name] = None
-                self.grid_shard_slice[dataset_name] = None
-                batch[dataset_name] = self.allgather_batch(batch[dataset_name], dataset_name)
+            self.grid_shard_sizes[dataset_name] = None
+            self.grid_shard_slice[dataset_name] = None
+            batch[dataset_name] = self.allgather_batch(batch[dataset_name], dataset_name)
+
         return batch
 
     def transfer_batch_to_device(
@@ -860,21 +854,36 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         return transferred_batch
 
     def _normalize_batch(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-        """Normalize batch for training and validation before every step.
-
-        Parameters
-        ----------
-        batch : dict[str, torch.Tensor]
-            Batch to prepare
-
-        Returns
-        -------
-        dict[str, torch.Tensor]
-            Normalized batch
-        """
         assert isinstance(batch, dict), "batch must be a dict keyed by dataset name"
+
         for dataset_name in batch:
+            # Run preprocessors (including grid-changing ones like regridding) on full reader-layout grid.
             batch[dataset_name] = self.model.pre_processors[dataset_name](batch[dataset_name])  # normalized in-place
+
+            # Stage 2: shard to model-layout (graph-sized) after preprocessing.
+            if self.keep_batch_sharded and self.model_comm_group_size > 1:
+                if self.model_comm_group is None:
+                    msg = "model_comm_group is None while keep_batch_sharded=True and model_comm_group_size>1."
+                    raise RuntimeError(msg)
+
+                shard_sizes = self.shard_sizes[dataset_name]
+                start, end = get_partition_range(
+                    partition_sizes=shard_sizes,
+                    partition_id=self.reader_group_rank,
+                )
+                self.grid_shard_sizes[dataset_name] = shard_sizes
+                self.grid_shard_slice[dataset_name] = slice(start, end)
+
+                batch[dataset_name] = shard_tensor(
+                    batch[dataset_name],
+                    self.grid_dim,
+                    shard_sizes,
+                    self.model_comm_group,
+                )
+            else:
+                self.grid_shard_sizes[dataset_name] = None
+                self.grid_shard_slice[dataset_name] = None
+
         return batch
 
     def _prepare_loss_scalers(self) -> None:
@@ -895,25 +904,11 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         pass
 
     def allgather_batch(self, batch: torch.Tensor, dataset_name: str) -> torch.Tensor:
-        """Allgather the batch-shards across the reader group.
+        grid_shard_sizes = self.reader_shard_sizes.get(dataset_name)
+        grid_size = self.reader_grid_sizes.get(dataset_name, batch.shape[self.grid_dim])
 
-        Parameters
-        ----------
-        batch : torch.Tensor
-            Batch-shard of current reader rank
-        dataset_name : str
-            Dataset name
-
-        Returns
-        -------
-        torch.Tensor
-            Allgathered (full) batch
-        """
-        grid_size = self.grid_sizes[dataset_name]
-        grid_shard_sizes = self.shard_sizes[dataset_name]
-
-        if grid_size == batch.shape[self.grid_dim] or self.reader_group_size == 1:
-            return batch  # already have the full grid
+        if grid_shard_sizes is None or self.reader_group_size == 1 or grid_size == batch.shape[self.grid_dim]:
+            return batch  # already full reader-layout tensor
 
         return gather_tensor(
             batch,

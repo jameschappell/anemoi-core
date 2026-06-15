@@ -9,22 +9,18 @@
 
 
 import logging
-import re
 import os
+import re
 import time
+from abc import ABC
 from abc import abstractmethod
 
-import networkx as nx
 import torch
 from torch_geometric.data import HeteroData
-from abc import ABC
-import numpy as np
 
-from anemoi.graphs.nodes.builders.base import BaseNodeBuilder
 from anemoi.graphs.generate.masks import KNNAreaMaskBuilder
-
-from anemoi.utils.grids import grids
-
+from anemoi.graphs.generate.reduced_gaussian import get_latlon_coords_gaussian
+from anemoi.graphs.nodes.builders.base import BaseNodeBuilder
 
 LOGGER = logging.getLogger(__name__)
 
@@ -72,29 +68,29 @@ class ReducedGaussianGridNodes(BaseNodeBuilder, ABC):
             A 2D tensor with the coordinates, in radians.
         """
         return self.create_nodes()
-    
+
     @abstractmethod
     def create_nodes(self) -> torch.Tensor: ...
- 
-    
+
+
 class ReducedGaussianNodes(ReducedGaussianGridNodes):
-    
+
     def create_nodes(self) -> torch.Tensor:
         # Synchronize downloads across distributed ranks
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             rank = torch.distributed.get_rank()
-            
+
             # Rank 0 downloads first and caches the data
             if rank == 0:
                 LOGGER.info(f"Rank 0: Downloading grid data for {self.grid}")
-                grid_data = grids(self.grid)
-            
+                coords_rad = get_latlon_coords_gaussian(self.grid)
+
             # Barrier to ensure rank 0 completes download before other ranks proceed
             torch.distributed.barrier()
-            
+
             # Other ranks can now access cached data
             if rank != 0:
-                grid_data = grids(self.grid)
+                coords_rad = get_latlon_coords_gaussian(self.grid)
         else:
             # Non-distributed case
             # Check if we're in a multi-process environment (even if distributed not yet initialized)
@@ -103,12 +99,13 @@ class ReducedGaussianNodes(ReducedGaussianGridNodes):
                 # Wait for rank 0 to download and cache the data
                 LOGGER.info(f"Rank {local_rank}: Waiting for rank 0 to cache grid data for {self.grid}")
                 time.sleep(3)
-            grid_data = grids(self.grid)
-        
-        coords = self.reshape_coords(grid_data["latitudes"], grid_data["longitudes"])
+            coords_rad = get_latlon_coords_gaussian(self.grid)
+
+        # coords_rad is shape (num_nodes, 2) with [lat, lon] in radians
+        coords = self.reshape_coords(coords_rad[:, 0], coords_rad[:, 1])
         return coords
-       
-    
+
+
 class LimitedAreaReducedGaussianGridNodes(ReducedGaussianGridNodes, ABC):
     """Nodes based on reduced gaussian grids using an area of interest.
 
@@ -164,11 +161,10 @@ class StretchedReducedGaussianGridNodes(LimitedAreaReducedGaussianGridNodes, ABC
             name=name,
         )
         self.global_grid = global_grid
-        
+
 
 class StretchedReducedGaussianNodes(StretchedReducedGaussianGridNodes):
-    """
-    Nodes from two reduced gaussian grids - a coarser global grid with a
+    """Nodes from two reduced gaussian grids - a coarser global grid with a
     higher resolution region in the area of interest.
     """
 

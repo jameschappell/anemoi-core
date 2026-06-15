@@ -237,3 +237,17 @@ class StepwiseProcessors(nn.Module):
 
     def set(self, lead_time: str, processors: "Processors") -> None:
         self._processors[str(lead_time)] = processors
+
+
+class ForwardOnlyPreProcessor(BasePreprocessor):
+    """Base preprocessor that is intentionally one-way.
+
+    `transform` must be implemented by subclasses.
+    `inverse_transform` is identity, so post-processing does not undo it.
+    """
+
+    def inverse_transform(self, x, in_place: bool = True, **kwargs) -> Tensor:
+        del kwargs
+        if not in_place:
+            x = x.clone()
+        return x

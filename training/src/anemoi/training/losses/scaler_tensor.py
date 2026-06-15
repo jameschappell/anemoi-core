@@ -233,6 +233,11 @@ class ScaleTensor(nn.Module):
             not scaler.requires_grad
         ), f"Scaler tensors must not require gradients. Got requires_grad=True for scaler {name!r}."
 
+        if scaler.layout == torch.strided:
+            scaler = scaler.clone(memory_format=torch.contiguous_format)
+        else:
+            scaler = scaler.clone()
+
         if isinstance(dimension, int):
             if len(scaler.shape) == 1:
                 dimension = (dimension,)
@@ -329,6 +334,11 @@ class ScaleTensor(nn.Module):
         if not isinstance(scaler, torch.Tensor):
             scaler = torch.tensor([scaler]) if isinstance(scaler, int | float) else torch.tensor(scaler)
 
+        if scaler.layout == torch.strided:
+            scaler = scaler.clone(memory_format=torch.contiguous_format)
+        else:
+            scaler = scaler.clone()
+
         if name not in self._tensors:
             msg = f"scaler {name!r} not found in scalers."
             raise ValueError(msg)
@@ -345,7 +355,13 @@ class ScaleTensor(nn.Module):
             self.add_scaler(dimension, scaler, name=name)
         except ValueError:
             self._tensors[name] = original_scaler
-            self.register_buffer(name, original_scaler_buffer, persistent=False)
+            restore_buffer = original_scaler_buffer
+            if restore_buffer is not None:
+                if restore_buffer.layout == torch.strided:
+                    restore_buffer = restore_buffer.clone(memory_format=torch.contiguous_format)
+                else:
+                    restore_buffer = restore_buffer.clone()
+            self.register_buffer(name, restore_buffer, persistent=False)
             raise
 
     def add(self, new_scalers: dict[str, TENSOR_SPEC] | list[TENSOR_SPEC] | None = None, **kwargs) -> None:

@@ -50,6 +50,12 @@ class BaseImputer(BasePreprocessor, ABC):
         # weight imputed values with zero in loss calculation
         self.register_buffer("loss_mask_training", torch.empty(0, dtype=torch.bool), persistent=False)
 
+    @staticmethod
+    def _owned(t: torch.Tensor) -> torch.Tensor:
+        if t.layout == torch.strided:
+            return t.clone(memory_format=torch.contiguous_format)
+        return t.clone()
+
     def _validate_indices(self):
         assert len(self.index_training_input) == len(self.index_inference_input) <= len(self.replacement), (
             f"Error creating imputation indices {len(self.index_training_input)}, "
@@ -206,14 +212,15 @@ class BaseImputer(BasePreprocessor, ABC):
 
             # save nan locations for input variables from training input, select first timestep whose nan locations are used for the loss mask and postprocessing
             # if batch size and grid sharding hasn't changed, use the allocated tensor. otherwise, reregister buffer.
+            new_nan = self._owned(nan_locations[:, 0, ..., self.data_indices.data.input.full])
             if (
                 len(self.nan_locations.shape) > 1
-                and self.nan_locations.shape[0] == nan_locations.shape[0]
-                and self.nan_locations.shape[1] == nan_locations.shape[2]
+                and self.nan_locations.shape[0] == new_nan.shape[0]
+                and self.nan_locations.shape[1] == new_nan.shape[1]
             ):
-                self.nan_locations[:] = nan_locations[:, 0, ..., self.data_indices.data.input.full]
+                self.nan_locations.copy_(new_nan)
             else:
-                self.nan_locations = nan_locations[:, 0, ..., self.data_indices.data.input.full]
+                self.nan_locations = new_nan
 
             # data indices for training input
             index = self.index_training_input
@@ -232,7 +239,7 @@ class BaseImputer(BasePreprocessor, ABC):
             # inference input
 
             # save nan masks of inference input for inverse transform
-            self.nan_locations = nan_locations[:, 0]
+            self.nan_locations = self._owned(nan_locations[:, 0])
 
             # data indices for training input
             index = self.index_inference_input
