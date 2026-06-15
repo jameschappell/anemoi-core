@@ -8,6 +8,7 @@ from typing import Optional
 
 import numpy as np
 import torch
+from einops import rearrange
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
@@ -76,23 +77,18 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
 
     @staticmethod
     def _load_matrix(path: str) -> torch.Tensor:
-        loaded = np.load(path)
+        with np.load(path, allow_pickle=False) as loaded:
+            shape = tuple(np.asarray(loaded["matrix_shape"], dtype=np.int64).tolist())
+            crow_indices = torch.from_numpy(np.asarray(loaded["matrix_indptr"], dtype=np.int64))
+            col_indices = torch.from_numpy(np.asarray(loaded["matrix_indices"], dtype=np.int64))
+            values = torch.from_numpy(np.asarray(loaded["matrix_data"], dtype=np.float32))
 
-        # NOTE: matrix_shape is (n_target, n_source)
-        shape = tuple(loaded["matrix_shape"].tolist())
-        row_ptr = loaded["matrix_indptr"]
-        col_idx = loaded["matrix_indices"]
-        values = loaded["matrix_data"].astype(np.float32, copy=False)
-
-        # Convert CSR -> COO indices for torch sparse COO tensor.
-        row_counts = np.diff(row_ptr)
-        rows = np.repeat(np.arange(shape[0], dtype=np.int64), row_counts)
-        cols = col_idx.astype(np.int64, copy=False)
-
-        indices = np.stack([rows, cols], axis=0)
-        i = torch.from_numpy(indices)
-        v = torch.from_numpy(values)
-        return torch.sparse_coo_tensor(i, v, size=shape).coalesce()
+        return torch.sparse_csr_tensor(
+            crow_indices,
+            col_indices,
+            values,
+            size=shape,
+        )
 
     def _extract_node_builder_cfg(self, node_spec: Any, role: str) -> dict | None:
         if node_spec is None:
@@ -110,7 +106,7 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
         builder_cfg = self._as_plain(builder_cfg)
 
         if not isinstance(builder_cfg, dict) or "_target_" not in builder_cfg:
-            raise ValueError(f"{role}_nodes must contain a node builder config with _target_. " f"Got: {builder_cfg}")
+            raise ValueError(f"{role}_nodes must contain a node builder config with _target_. Got: {builder_cfg}")
 
         return dict(builder_cfg)
 
@@ -191,24 +187,36 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
                 self.source_grid_size,
             )
 
+    def _matrix_for(self, x2d: torch.Tensor) -> torch.Tensor:
+        matrix = self.regrid_matrix
+        if matrix.device != x2d.device or matrix.dtype != x2d.dtype:
+            matrix = matrix.to(device=x2d.device, dtype=x2d.dtype)
+            self.regrid_matrix = matrix
+        return matrix
+
+    @staticmethod
+    def _left_sparse_mm(matrix: torch.Tensor, x2d: torch.Tensor) -> torch.Tensor:
+        # matrix: [n_target, n_source], x2d: [N, n_source] -> [N, n_target]
+        return torch.sparse.mm(matrix, x2d.transpose(0, 1)).transpose(0, 1)
+
     def _apply_matrix(self, x2d: torch.Tensor) -> torch.Tensor:
-        # x2d shape: [N, n_source]
-        # output    : [N, n_target]
-        if self.regrid_matrix.device != x2d.device:
-            self.regrid_matrix = self.regrid_matrix.to(x2d.device)
+        matrix = self._matrix_for(x2d)
 
         if not self.nan_safe:
-            return torch.sparse.mm(self.regrid_matrix, x2d.T).T
+            return self._left_sparse_mm(matrix, x2d)
 
-        finite = torch.isfinite(x2d)
-        if finite.all():
-            return torch.sparse.mm(self.regrid_matrix, x2d.T).T
+        invalid = ~torch.isfinite(x2d)
+        if not bool(invalid.any()):
+            return self._left_sparse_mm(matrix, x2d)
 
-        x_filled = torch.where(finite, x2d, torch.zeros_like(x2d))
-        out = torch.sparse.mm(self.regrid_matrix, x_filled.T).T
+        # Lower-allocation NaN-safe path:
+        # clone + masked_fill_ avoids extra zeros_like/where temporaries.
+        x_filled = x2d.clone()
+        x_filled.masked_fill_(invalid, 0.0)
 
-        bad_weight = torch.sparse.mm(self.regrid_matrix, (~finite).to(x2d.dtype).T).T
-        out = torch.where(bad_weight > self.min_valid_weight, torch.nan, out)
+        out = self._left_sparse_mm(matrix, x_filled)
+        invalid_weight = self._left_sparse_mm(matrix, invalid.to(dtype=x2d.dtype))
+        out.masked_fill_(invalid_weight > self.min_valid_weight, torch.nan)
         return out
 
     def transform(self, x: torch.Tensor, in_place: bool = True, **kwargs) -> torch.Tensor:
@@ -219,16 +227,20 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
         if x.ndim < 2:
             raise ValueError(f"Expected at least 2 dims [..., grid, vars], got shape {tuple(x.shape)}")
 
-        n_source_expected = self.source_grid_size
         n_source = x.shape[-2]
-        if n_source != n_source_expected:
-            raise ValueError(f"Grid size mismatch: tensor has {n_source} points, matrix expects {n_source_expected}")
+        if n_source != self.source_grid_size:
+            raise ValueError(
+                f"Grid size mismatch: tensor has {n_source} points, matrix expects {self.source_grid_size}"
+            )
 
-        # Flatten all leading dims and vars into batch dimension, apply regrid on grid axis.
-        # x: [..., grid, vars] -> [N, grid]
-        x2d = x.transpose(-2, -1).reshape(-1, n_source)
+        n_vars = x.shape[-1]
+        leading_shape = x.shape[:-2]
+        n_leading = int(np.prod(leading_shape, dtype=np.int64)) if leading_shape else 1
+
+        # [..., grid, vars] -> [(leading * vars), grid]
+        x2d = rearrange(x, "... grid vars -> (... vars) grid").contiguous()
         y2d = self._apply_matrix(x2d)
 
-        n_target = self.target_grid_size
-        y = y2d.reshape(*x.shape[:-2], x.shape[-1], n_target).transpose(-2, -1)
-        return y
+        # [(leading * vars), new_grid] -> [leading, new_grid, vars] -> [..., new_grid, vars]
+        y = rearrange(y2d, "(lead vars) new_grid -> lead new_grid vars", lead=n_leading, vars=n_vars)
+        return y.reshape(*leading_shape, self.target_grid_size, n_vars)
