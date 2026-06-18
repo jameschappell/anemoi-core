@@ -895,6 +895,29 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         self.update_scalers(callback=AvailableCallbacks.ON_BATCH_START)
         return
 
+    def _postprocess_with_shard_context(
+        self,
+        post_processor: torch.nn.Module,
+        y: torch.Tensor,
+        y_pred: torch.Tensor,
+        grid_shard_slice: slice | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        # Apply shard context only to processors that support it.
+        for processor in post_processor.processors.values():
+            setter = getattr(processor, "set_grid_shard_slice", None)
+            if callable(setter):
+                setter(grid_shard_slice)
+
+        try:
+            y_postprocessed = post_processor(y, in_place=False)
+            y_pred_postprocessed = post_processor(y_pred, in_place=False)
+            return y_postprocessed, y_pred_postprocessed
+        finally:
+            for processor in post_processor.processors.values():
+                setter = getattr(processor, "set_grid_shard_slice", None)
+                if callable(setter):
+                    setter(None)
+
     @abstractmethod
     def _step(
         self,
@@ -951,8 +974,13 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         metrics_dict = self.metrics[dataset_name]
         val_metric_ranges = self.val_metric_ranges[dataset_name]
 
-        y_postprocessed = post_processor(y, in_place=False)
-        y_pred_postprocessed = post_processor(y_pred, in_place=False)
+        # Set the grid shard slice for post-processors if they support it
+        y_postprocessed, y_pred_postprocessed = self._postprocess_with_shard_context(
+            post_processor,
+            y,
+            y_pred,
+            grid_shard_slice,
+        )
 
         suffix = "" if step is None else f"/{step + 1}"
         for metric_name, metric in metrics_dict.items():

@@ -49,6 +49,17 @@ class BaseImputer(BasePreprocessor, ABC):
         self.register_buffer("nan_locations", torch.empty(0, dtype=torch.bool), persistent=False)
         # weight imputed values with zero in loss calculation
         self.register_buffer("loss_mask_training", torch.empty(0, dtype=torch.bool), persistent=False)
+        self._grid_shard_slice: slice | None = None
+
+    def set_grid_shard_slice(self, grid_shard_slice: slice) -> None:
+        """Set the grid shard slice for the imputer.
+
+        Parameters
+        ----------
+        grid_shard_slice : slice
+            Slice object representing the grid shard.
+        """
+        self._grid_shard_slice = grid_shard_slice
 
     @staticmethod
     def _owned(t: torch.Tensor) -> torch.Tensor:
@@ -252,6 +263,32 @@ class BaseImputer(BasePreprocessor, ABC):
         # Replace values
         return self.fill_with_value(x, index, nan_locations, index)
 
+    def _nan_locations_for_inverse(self, x: torch.Tensor) -> torch.Tensor:
+        nan_locations = self.nan_locations
+
+        if nan_locations.numel() == 0:
+            return nan_locations
+
+        # nan_locations is expected [batch, grid, vars]
+        if x.shape[-2] == nan_locations.shape[-2]:
+            return nan_locations
+
+        if self._grid_shard_slice is None:
+            raise IndexError(
+                "NaN mask/grid mismatch and no shard slice set. "
+                f"tensor grid={x.shape[-2]}, mask grid={nan_locations.shape[-2]}"
+            )
+
+        sharded_nan_locations = nan_locations[:, self._grid_shard_slice, :]
+
+        if x.shape[-2] != sharded_nan_locations.shape[-2]:
+            raise IndexError(
+                "NaN mask still mismatched after applying shard slice. "
+                f"tensor grid={x.shape[-2]}, shard-mask grid={sharded_nan_locations.shape[-2]}"
+            )
+
+        return sharded_nan_locations
+
     def inverse_transform(
         self,
         x: torch.Tensor,
@@ -280,10 +317,14 @@ class BaseImputer(BasePreprocessor, ABC):
             x.shape[0] == self.nan_locations.shape[0]
         ), f"Batch dimension of input tensor ({x.shape[0]}) does not match the batch dimension of nan locations ({self.nan_locations.shape[0]}). Are you using the postprocessors without running the preprocessor first?"
 
+        nan_locations = self._nan_locations_for_inverse(x)
+
+        assert x.shape[0] == nan_locations.shape[0], ...
         # Replace values
         for idx_src, idx_dst in zip(self.index_inference_input, index):
             if idx_src is not None and idx_dst is not None:
-                x[..., idx_dst][self._expand_subset_mask(x, idx_src, self.nan_locations)] = torch.nan
+                x[..., idx_dst][self._expand_subset_mask(x, idx_src, nan_locations)] = torch.nan
+
         return x
 
 
