@@ -102,8 +102,7 @@ class ReducedGaussianNodes(ReducedGaussianGridNodes):
             coords_rad = get_latlon_coords_gaussian(self.grid)
 
         # coords_rad is shape (num_nodes, 2) with [lat, lon] in radians
-        coords = self.reshape_coords(coords_rad[:, 0], coords_rad[:, 1])
-        return coords
+        return torch.from_numpy(coords_rad)
 
 
 class LimitedAreaReducedGaussianGridNodes(ReducedGaussianGridNodes, ABC):
