@@ -357,7 +357,7 @@ class TestValidateCheckpoint:
         checkpoint = {"state_dict": corrupted_state_dict}
 
         with pytest.raises(CheckpointValidationError) as exc_info:
-            validate_checkpoint(checkpoint)
+            validate_checkpoint(checkpoint, check_tensors=True)
 
         assert "NaN values" in str(exc_info.value)
         assert "corrupted_tensor" in str(exc_info.value)
@@ -372,7 +372,7 @@ class TestValidateCheckpoint:
         checkpoint = {"state_dict": corrupted_state_dict}
 
         with pytest.raises(CheckpointValidationError) as exc_info:
-            validate_checkpoint(checkpoint)
+            validate_checkpoint(checkpoint, check_tensors=True)
 
         assert "infinite values" in str(exc_info.value)
         assert "inf_tensor" in str(exc_info.value)
@@ -387,7 +387,7 @@ class TestValidateCheckpoint:
             },
         }
 
-        assert validate_checkpoint(checkpoint) is True
+        assert validate_checkpoint(checkpoint, check_tensors=True) is True
 
     @pytest.mark.unit
     def test_validate_checkpoint_nested_nan_tensors(self) -> None:
@@ -399,7 +399,7 @@ class TestValidateCheckpoint:
         }
 
         with pytest.raises(CheckpointValidationError) as exc_info:
-            validate_checkpoint(checkpoint)
+            validate_checkpoint(checkpoint, check_tensors=True)
 
         assert "model_state_dict.layer1.bias" in str(exc_info.value)
 
@@ -414,7 +414,7 @@ class TestValidateCheckpoint:
         }
 
         with pytest.raises(CheckpointValidationError) as exc_info:
-            validate_checkpoint(checkpoint)
+            validate_checkpoint(checkpoint, check_tensors=True)
 
         # Should capture both errors
         error_str = str(exc_info.value)

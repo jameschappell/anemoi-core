@@ -155,9 +155,7 @@ def remap_checkpoint_dataset(
 
 
 def get_trainable_key(param_name: str) -> str | None:
-    """
-    Helper function used when transfer learning to identify changes in trainable_parameters numbers.
-    """
+    """Helper function used when transfer learning to identify changes in trainable_parameters numbers."""
     if ".encoder." in param_name:
         return "data2hidden"
     if ".decoder." in param_name:
@@ -172,7 +170,7 @@ def get_trainable_key(param_name: str) -> str | None:
 
 
 def transfer_learning_loading(
-    model: torch.nn.Module, 
+    model: torch.nn.Module,
     ckpt_path: Path | str,
     model_config: dict,
     dataset_remapping: dict[str, str] | None = None,
@@ -184,24 +182,24 @@ def transfer_learning_loading(
     # apply chunking migration (fails silently otherwise leading to hard to debug issues)
     # this is due to loading with strict=False, planning to make this more robust in the future
     checkpoint = chunking_fix_migration(checkpoint)
-    
+
     # extract trainable_parameters dictionary from the model config
     trainable_parameters = model_config.trainable_parameters
 
     # Refresh processor stats from the current dataset if configured.
     model._update_checkpoint_state_dict_for_load(checkpoint)
 
-    # check whether sizes of components are compatible, either matching or differing by 
+    # check whether sizes of components are compatible, either matching or differing by
     # trainable_parameters
     state_dict = checkpoint["state_dict"]
-    
+
     # Remap dataset names in state_dict before loading
     if dataset_remapping:
         LOGGER.info("Applying dataset remapping: %s", dataset_remapping)
         state_dict = remap_checkpoint_dataset(state_dict, dataset_remapping)
 
     model_state_dict = model.state_dict()
-    
+
     for key in list(state_dict.keys()):
         if key not in model_state_dict:
             continue
@@ -220,12 +218,12 @@ def transfer_learning_loading(
         # check whether the size of the parameter grows by the number of trainable parameters
         # if so, load it into the matching slice of the tensor
         growth_key = get_trainable_key(key)
-        
-        if growth_key is None:          
+
+        if growth_key is None:
             LOGGER.info("Skipping %s (no growth rule)", key)
             del state_dict[key]
             continue
-        
+
         allowed_growth = trainable_parameters.get(growth_key, None)
 
         if allowed_growth is None:
@@ -234,11 +232,11 @@ def transfer_learning_loading(
             continue
 
         # compute per-dimension differences
-        diffs = [m - c for c, m in zip(ckpt_tensor.shape, model_tensor.shape)]
+        diffs = [m - c for c, m in zip(ckpt_tensor.shape, model_tensor.shape, strict=False)]
 
         # only allow change in parameter size in ONE dimension equal to allowed_growth
         # if checkpoint parameter has shape [num_channels, size], model has [num_channels, size + allowed_growth]
-        # then can load weights into first [num_channels, size] of the model weights 
+        # then can load weights into first [num_channels, size] of the model weights
         # i.e. only the trainable_parameters are initialised from scratch
         positive_diffs = [d for d in diffs if d > 0]
 
@@ -248,7 +246,7 @@ def transfer_learning_loading(
             LOGGER.info("Model shape: %s", tuple(model_tensor.shape))
 
             new_tensor = model_tensor.clone()
-            slices = tuple(slice(0, min(c, m)) for c, m in zip(ckpt_tensor.shape, model_tensor.shape))
+            slices = tuple(slice(0, min(c, m)) for c, m in zip(ckpt_tensor.shape, model_tensor.shape, strict=False))
             new_tensor[slices] = ckpt_tensor[slices]
             state_dict[key] = new_tensor
         else:
@@ -259,25 +257,15 @@ def transfer_learning_loading(
 
     # Load the filtered st-ate_dict into the model
     model.load_state_dict(state_dict, strict=False)
-
-    ## Needed for data indices check
+    # Needed for data indices check - data_indices is a dict[str, IndexCollection]
     data_indices = checkpoint["hyper_parameters"]["data_indices"]
-
     if isinstance(data_indices, dict):
-        # New format: data_indices is always a dict in new code (even for single-dataset)
-        LOGGER.info("Loading checkpoint with datasets: %s", list(data_indices.keys()))
         model._ckpt_model_name_to_index = {
-            dataset_name: indices.name_to_index for dataset_name, indices in data_indices.items()
+            k: v.name_to_index for k, v in data_indices.items() if hasattr(v, "name_to_index")
         }
     else:
-        # Old format: data_indices is a single IndexCollection object (not dict)
-        msg = (
-            f"Checkpoint at '{ckpt_path}' was created with an older version of anemoi-core "
-            "that does not support multi-dataset training. This checkpoint is incompatible "
-            "with transfer learning in the current version."
-        )
-        raise TypeError(msg)
-
+        # Legacy single-dataset format
+        model._ckpt_model_name_to_index = data_indices.name_to_index
     return model
 
 
