@@ -431,8 +431,20 @@ class AnemoiTrainer(ABC):
             # Freeze the chosen model weights
             LOGGER.info("The following submodules will NOT be trained: %s", self.config.training.submodules_to_freeze)
             for submodule_name in self.config.training.submodules_to_freeze:
-                freeze_submodule_by_name(model, submodule_name)
-                LOGGER.info("%s frozen successfully.", submodule_name.upper())
+                freeze_summary = freeze_submodule_by_name(model, submodule_name)
+                if freeze_summary["matched_module_paths"]:
+                    LOGGER.info(
+                        "%s frozen successfully: matched_submodules=%d, frozen_tensors=%d, frozen_elements=%d",
+                        submodule_name.upper(),
+                        len(freeze_summary["matched_module_paths"]),
+                        freeze_summary["frozen_parameter_count"],
+                        freeze_summary["frozen_parameter_elements"],
+                    )
+                else:
+                    LOGGER.warning(
+                        "Requested freeze target '%s' did not match any submodules.",
+                        submodule_name,
+                    )
 
         return model
 

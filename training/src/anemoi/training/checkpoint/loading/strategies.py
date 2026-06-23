@@ -92,10 +92,24 @@ class TransferLearningLoader(LoadingStrategy):
     skip_mismatched : bool, optional
         Whether to skip keys with mismatched shapes (default: True).
         If False, shape mismatches raise ``CheckpointIncompatibleError``.
+    remap_dataset : dict[str, str] | None, optional
+        Optional checkpoint dataset-name remapping applied to state-dict
+        keys before filtering, e.g. ``{'era5': 'gm'}``.
+    exclude_key_prefixes : list[str] | None, optional
+        Optional list of key prefixes to always exclude from transfer.
+        This is useful for dataset-dependent tensors (e.g. preprocessors,
+        postprocessors, node attributes) that should be kept from the new model.
     """
 
-    def __init__(self, skip_mismatched: bool = True) -> None:
+    def __init__(
+        self,
+        skip_mismatched: bool = True,
+        remap_dataset: dict[str, str] | None = None,
+        exclude_key_prefixes: list[str] | None = None,
+    ) -> None:
         self.skip_mismatched = skip_mismatched
+        self.remap_dataset = remap_dataset or {}
+        self.exclude_key_prefixes = tuple(exclude_key_prefixes or [])
 
     async def process(self, context: CheckpointContext) -> CheckpointContext:
         """Filter and load compatible weights from checkpoint.
@@ -111,11 +125,103 @@ class TransferLearningLoader(LoadingStrategy):
             Context with compatible weights loaded and metadata updated.
         """
         from anemoi.training.checkpoint.loading.utils import filter_state_dict
+        from anemoi.training.checkpoint.loading.utils import remap_dataset_keys
 
         source_state = self._extract_state_dict(context)
         target_state = context.model.state_dict()
 
+        if self.remap_dataset:
+            source_state, remapped_keys, collisions = remap_dataset_keys(
+                source_state,
+                self.remap_dataset,
+                target_keys=set(target_state.keys()),
+            )
+            context.metadata["dataset_remap"] = dict(self.remap_dataset)
+            context.metadata["dataset_remap_key_count"] = len(remapped_keys)
+            context.metadata["dataset_remap_collision_count"] = sum(len(v) for v in collisions.values())
+
+            LOGGER.info(
+                "Transfer learning dataset remap applied: %s (remapped %d keys, collisions %d)",
+                self.remap_dataset,
+                len(remapped_keys),
+                sum(len(v) for v in collisions.values()),
+            )
+
+            preview_limit = 20
+            remapped_preview = list(remapped_keys.items())[:preview_limit]
+            if remapped_preview:
+                LOGGER.info(
+                    "Transfer learning remapped parameter keys (first %d): %s",
+                    len(remapped_preview),
+                    remapped_preview,
+                )
+
+            collision_preview = list(collisions.items())[:preview_limit]
+            if collision_preview:
+                LOGGER.warning(
+                    "Transfer learning remap collisions (first %d): %s",
+                    len(collision_preview),
+                    collision_preview,
+                )
+
+        excluded_keys: list[str] = []
+        if self.exclude_key_prefixes:
+            filtered_source_state = {}
+            for key, value in source_state.items():
+                if key.startswith(self.exclude_key_prefixes):
+                    excluded_keys.append(key)
+                else:
+                    filtered_source_state[key] = value
+            source_state = filtered_source_state
+
+            context.metadata["exclude_key_prefixes"] = list(self.exclude_key_prefixes)
+            context.metadata["excluded_param_count"] = len(excluded_keys)
+
+            LOGGER.info(
+                "Transfer learning excluded %d keys by prefix filters: %s",
+                len(excluded_keys),
+                list(self.exclude_key_prefixes),
+            )
+
+            preview_limit = 20
+            excluded_preview = excluded_keys[:preview_limit]
+            if excluded_preview:
+                LOGGER.info(
+                    "Transfer learning excluded parameter keys (first %d): %s",
+                    len(excluded_preview),
+                    excluded_preview,
+                )
+
         filtered, skipped = filter_state_dict(source_state, target_state)
+
+        for key in excluded_keys:
+            skipped[key] = "Excluded by prefix filter"
+
+        missing_target_keys = [k for k, reason in skipped.items() if reason == "Key not in target"]
+        shape_mismatch_keys = [k for k, reason in skipped.items() if reason.startswith("Shape mismatch")]
+        excluded_by_filter_keys = [k for k, reason in skipped.items() if reason == "Excluded by prefix filter"]
+
+        shape_mismatch_details = []
+        for key in shape_mismatch_keys:
+            source_tensor = source_state.get(key)
+            target_tensor = target_state.get(key)
+
+            source_shape = tuple(source_tensor.shape) if source_tensor is not None and hasattr(source_tensor, "shape") else None
+            target_shape = tuple(target_tensor.shape) if target_tensor is not None and hasattr(target_tensor, "shape") else None
+
+            if source_shape is not None and target_shape is not None and len(source_shape) == len(target_shape):
+                shape_delta = tuple(target_dim - source_dim for source_dim, target_dim in zip(source_shape, target_shape))
+            else:
+                shape_delta = None
+
+            shape_mismatch_details.append(
+                {
+                    "key": key,
+                    "source_shape": source_shape,
+                    "target_shape": target_shape,
+                    "shape_delta": shape_delta,
+                },
+            )
 
         if not self.skip_mismatched:
             shape_skipped = {k: v for k, v in skipped.items() if "Shape mismatch" in v}
@@ -145,12 +251,68 @@ class TransferLearningLoader(LoadingStrategy):
         context.metadata["loading_strategy"] = "transfer_learning"
         context.metadata["transferred_params"] = list(filtered.keys())
         context.metadata["skipped_params"] = skipped
+        context.metadata["transferred_param_count"] = len(filtered)
+        context.metadata["skipped_param_count"] = len(skipped)
+        context.metadata["skipped_missing_target_count"] = len(missing_target_keys)
+        context.metadata["skipped_shape_mismatch_count"] = len(shape_mismatch_keys)
+        context.metadata["skipped_shape_mismatch_details"] = shape_mismatch_details
+        context.metadata["skipped_excluded_by_filter_count"] = len(excluded_by_filter_keys)
 
         LOGGER.info(
-            "Transfer learning: loaded %d params, skipped %d",
+            "Transfer learning: loaded %d params, skipped %d (missing target: %d, shape mismatch: %d, excluded: %d)",
             len(filtered),
             len(skipped),
+            len(missing_target_keys),
+            len(shape_mismatch_keys),
+            len(excluded_by_filter_keys),
         )
+
+        preview_limit = 20
+        transferred_preview = list(filtered.keys())[:preview_limit]
+        skipped_missing_preview = missing_target_keys[:preview_limit]
+        skipped_shape_preview = shape_mismatch_keys[:preview_limit]
+        skipped_excluded_preview = excluded_by_filter_keys[:preview_limit]
+
+        if transferred_preview:
+            LOGGER.info(
+                "Transfer learning loaded parameter names (first %d): %s",
+                len(transferred_preview),
+                transferred_preview,
+            )
+        if skipped_missing_preview:
+            LOGGER.info(
+                "Transfer learning skipped (missing target key) parameter names (first %d): %s",
+                len(skipped_missing_preview),
+                skipped_missing_preview,
+            )
+        if skipped_shape_preview:
+            LOGGER.info(
+                "Transfer learning skipped (shape mismatch) parameter names (first %d): %s",
+                len(skipped_shape_preview),
+                skipped_shape_preview,
+            )
+
+            shape_detail_preview = [
+                (
+                    detail["key"],
+                    detail["source_shape"],
+                    detail["target_shape"],
+                    detail["shape_delta"],
+                )
+                for detail in shape_mismatch_details[:preview_limit]
+            ]
+            LOGGER.info(
+                "Transfer learning shape mismatch details (first %d) as "
+                "(key, checkpoint_shape, target_shape, target-minus-checkpoint): %s",
+                len(shape_detail_preview),
+                shape_detail_preview,
+            )
+        if skipped_excluded_preview:
+            LOGGER.info(
+                "Transfer learning skipped (excluded by prefix filter) parameter names (first %d): %s",
+                len(skipped_excluded_preview),
+                skipped_excluded_preview,
+            )
 
         return context
 

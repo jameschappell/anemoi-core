@@ -13,6 +13,7 @@ import time
 import uuid
 from pathlib import Path
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 import torchinfo
@@ -137,6 +138,60 @@ class AnemoiCheckpoint(ModelCheckpoint):
         """Defines the filepath for the inference checkpoint."""
         return Path(filepath).parent / Path("inference-" + str(Path(filepath).name))
 
+    @staticmethod
+    def _sync_supporting_arrays_with_model_grid(model: torch.nn.Module, supporting_arrays: dict) -> dict:
+        """Align checkpoint supporting lat/lon arrays with the model's current grid.
+
+        This ensures saved metadata reflects post-preprocessing model layout
+        (e.g. after regridding) rather than raw reader-layout coordinates.
+        """
+        node_attributes = getattr(getattr(model, "model", None), "node_attributes", None)
+        if node_attributes is None:
+            return supporting_arrays
+
+        for dataset_name in list(supporting_arrays.keys()):
+            dataset_arrays = supporting_arrays.get(dataset_name)
+            if not isinstance(dataset_arrays, dict):
+                continue
+
+            try:
+                coordinates = node_attributes.get_coordinates(dataset_name)
+            except Exception:
+                LOGGER.debug(
+                    "Could not resolve node coordinates for dataset '%s'; keeping original supporting arrays",
+                    dataset_name,
+                    exc_info=True,
+                )
+                continue
+
+            if coordinates is None:
+                continue
+
+            if isinstance(coordinates, torch.Tensor):
+                coords_np = coordinates.detach().cpu().numpy()
+            else:
+                coords_np = np.asarray(coordinates)
+
+            if coords_np.ndim != 2 or coords_np.shape[1] < 2:
+                LOGGER.warning(
+                    "Unexpected coordinate shape %s for dataset '%s'; expected [n_nodes, 2]. "
+                    "Keeping original supporting arrays.",
+                    tuple(coords_np.shape),
+                    dataset_name,
+                )
+                continue
+
+            dataset_arrays["latitudes"] = coords_np[:, 0].astype(np.float32, copy=False)
+            dataset_arrays["longitudes"] = coords_np[:, 1].astype(np.float32, copy=False)
+
+            LOGGER.info(
+                "Updated supporting arrays for dataset '%s' from model grid: lat/lon shape=%s",
+                dataset_name,
+                tuple(dataset_arrays["latitudes"].shape),
+            )
+
+        return supporting_arrays
+
     def on_train_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         """Check that model's metadata does not contain Pydantic schemas references."""
         super().on_train_start(trainer, pl_module)
@@ -177,6 +232,7 @@ class AnemoiCheckpoint(ModelCheckpoint):
             # Make sure we don't accidentally modify these
             metadata = tmp_metadata.copy()
             supporting_arrays = tmp_supporting_arrays.copy()
+            supporting_arrays = self._sync_supporting_arrays_with_model_grid(model, supporting_arrays)
 
             inference_checkpoint_filepath = self._get_inference_checkpoint_filepath(lightning_checkpoint_filepath)
 
@@ -213,6 +269,7 @@ class AnemoiCheckpoint(ModelCheckpoint):
                 model = self._torch_drop_down(trainer)
                 metadata = model.metadata.copy()
                 supporting_arrays = model.supporting_arrays.copy()
+                supporting_arrays = self._sync_supporting_arrays_with_model_grid(model, supporting_arrays)
 
                 save_metadata(lightning_checkpoint_filepath, metadata, supporting_arrays=supporting_arrays)
 

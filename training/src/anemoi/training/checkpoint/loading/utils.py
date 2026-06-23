@@ -83,6 +83,98 @@ def filter_state_dict(
     return filtered, skipped
 
 
+def remap_dataset_keys(
+    source: dict[str, Any],
+    remap_dataset: dict[str, str],
+    target_keys: set[str] | None = None,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, list[str]]]:
+    """Remap dataset-name segments in checkpoint parameter keys.
+
+    The remapping is structure-agnostic and does not rely on hardcoded
+    module prefixes. Instead, each key is tokenized by ``.`` and any token
+    matching a ``remap_dataset`` source name is replaced with its target
+    name if that candidate key exists in ``target_keys``. This keeps the
+    behavior robust to model refactors.
+
+    Parameters
+    ----------
+    source : dict[str, Any]
+        Source checkpoint state dict.
+    remap_dataset : dict[str, str]
+        Mapping from checkpoint dataset name to target dataset name,
+        e.g. ``{'era5': 'gm'}``.
+    target_keys : set[str], optional
+        Target model state-dict keys. When provided, remaps are only
+        applied if the remapped key exists in this set.
+
+    Returns
+    -------
+    tuple[dict[str, Any], dict[str, str], dict[str, list[str]]]
+        ``(remapped_state_dict, remapped_keys, collisions)`` where
+        ``remapped_keys`` maps old key names to new key names for changed
+        entries, and ``collisions`` maps destination keys to source keys
+        that were not
+        applied because another key already mapped to the same destination.
+    """
+    if not remap_dataset:
+        return dict(source), {}, {}
+
+    target_keys = target_keys or set()
+
+    def remap_key_against_target(old_key: str, target_keys: set[str]) -> str:
+        parts = old_key.split(".")
+
+        # Try single-token substitutions from remap_dataset and only accept
+        # candidates that exist in the target model state dict.
+        for i, token in enumerate(parts):
+            for source_name, target_name in remap_dataset.items():
+                if source_name == target_name:
+                    continue
+
+                candidate_tokens: list[str] = []
+
+                # Case 1: whole token is the dataset name (e.g. ".era5.")
+                if token == source_name:
+                    candidate_tokens.append(target_name)
+
+                # Case 2: dataset name appears as an underscore-delimited segment
+                # (e.g. "latlons_era5" -> "latlons_gm").
+                underscore_segments = token.split("_")
+                if source_name in underscore_segments:
+                    replaced_segments = [target_name if seg == source_name else seg for seg in underscore_segments]
+                    remapped_token = "_".join(replaced_segments)
+                    if remapped_token != token:
+                        candidate_tokens.append(remapped_token)
+
+                for candidate_token in candidate_tokens:
+                    candidate_parts = list(parts)
+                    candidate_parts[i] = candidate_token
+                    candidate = ".".join(candidate_parts)
+
+                    if candidate in target_keys:
+                        return candidate
+
+        return old_key
+
+    remapped_keys: dict[str, str] = {}
+    remapped_state: dict[str, Any] = {}
+    collisions: dict[str, list[str]] = {}
+
+    for old_key, value in source.items():
+        new_key = remap_key_against_target(old_key, target_keys) if target_keys else old_key
+
+        if new_key in remapped_state and old_key != new_key:
+            collisions.setdefault(new_key, []).append(old_key)
+            continue
+
+        if new_key != old_key:
+            remapped_keys[old_key] = new_key
+
+        remapped_state[new_key] = value
+
+    return remapped_state, remapped_keys, collisions
+
+
 def match_state_dict_keys(
     source_dict: dict[str, Any],
     target_dict: dict[str, Any],

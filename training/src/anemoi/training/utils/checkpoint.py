@@ -175,6 +175,12 @@ def transfer_learning_loading(
     model_config: dict,
     dataset_remapping: dict[str, str] | None = None,
 ) -> nn.Module:
+    preview_limit = 20
+
+    def add_preview(container: list[str], value: str) -> None:
+        if len(container) < preview_limit:
+            container.append(value)
+
     # Load the checkpoint
     LOGGER.debug("Loading checkpoint to device: %s", model.device)
     checkpoint = torch.load(ckpt_path, weights_only=False, map_location=model.device)
@@ -192,6 +198,23 @@ def transfer_learning_loading(
     # check whether sizes of components are compatible, either matching or differing by
     # trainable_parameters
     state_dict = checkpoint["state_dict"]
+    checkpoint_param_count = len(state_dict)
+
+    exact_match_count = 0
+    partial_load_count = 0
+
+    skipped_missing_target_count = 0
+    skipped_different_ndim_count = 0
+    skipped_missing_growth_key_count = 0
+    skipped_missing_allowed_growth_count = 0
+    skipped_shape_mismatch_count = 0
+
+    partial_loaded_preview: list[str] = []
+    skipped_missing_target_preview: list[str] = []
+    skipped_different_ndim_preview: list[str] = []
+    skipped_missing_growth_key_preview: list[str] = []
+    skipped_missing_allowed_growth_preview: list[str] = []
+    skipped_shape_mismatch_preview: list[str] = []
 
     # Remap dataset names in state_dict before loading
     if dataset_remapping:
@@ -202,15 +225,20 @@ def transfer_learning_loading(
 
     for key in list(state_dict.keys()):
         if key not in model_state_dict:
+            skipped_missing_target_count += 1
+            add_preview(skipped_missing_target_preview, key)
             continue
 
         ckpt_tensor = state_dict[key]
         model_tensor = model_state_dict[key]
 
         if ckpt_tensor.shape == model_tensor.shape:
+            exact_match_count += 1
             continue  # perfect match
 
         if ckpt_tensor.ndim != model_tensor.ndim:
+            skipped_different_ndim_count += 1
+            add_preview(skipped_different_ndim_preview, key)
             LOGGER.info("Skipping %s (different ndim)", key)
             del state_dict[key]
             continue
@@ -220,14 +248,18 @@ def transfer_learning_loading(
         growth_key = get_trainable_key(key)
 
         if growth_key is None:
-            LOGGER.info("Skipping %s (no growth rule)", key)
+            skipped_missing_growth_key_count += 1
+            add_preview(skipped_missing_growth_key_preview, key)
+            LOGGER.info("Skipping %s (no matching trainable parameter growth key)", key)
             del state_dict[key]
             continue
 
         allowed_growth = trainable_parameters.get(growth_key, None)
 
         if allowed_growth is None:
-            LOGGER.info("Skipping %s (no growth rule)", key)
+            skipped_missing_allowed_growth_count += 1
+            add_preview(skipped_missing_allowed_growth_preview, key)
+            LOGGER.info("Skipping %s (growth key '%s' not configured)", key, growth_key)
             del state_dict[key]
             continue
 
@@ -241,6 +273,8 @@ def transfer_learning_loading(
         positive_diffs = [d for d in diffs if d > 0]
 
         if positive_diffs == [allowed_growth] and all(d >= 0 for d in diffs):
+            partial_load_count += 1
+            add_preview(partial_loaded_preview, key)
             LOGGER.info("Partially loading %s with allowed growth %d from key %s", key, allowed_growth, growth_key)
             LOGGER.info("Checkpoint shape: %s", tuple(ckpt_tensor.shape))
             LOGGER.info("Model shape: %s", tuple(model_tensor.shape))
@@ -250,13 +284,83 @@ def transfer_learning_loading(
             new_tensor[slices] = ckpt_tensor[slices]
             state_dict[key] = new_tensor
         else:
+            skipped_shape_mismatch_count += 1
+            add_preview(skipped_shape_mismatch_preview, key)
             LOGGER.info("Skipping %s (shape change not matching config)", key)
             LOGGER.info("Checkpoint shape: %s", tuple(ckpt_tensor.shape))
             LOGGER.info("Model shape: %s", tuple(model_tensor.shape))
             del state_dict[key]
 
     # Load the filtered st-ate_dict into the model
-    model.load_state_dict(state_dict, strict=False)
+    load_result = model.load_state_dict(state_dict, strict=False)
+
+    missing_keys = list(getattr(load_result, "missing_keys", []))
+    unexpected_keys = list(getattr(load_result, "unexpected_keys", []))
+    missing_preview = missing_keys[:preview_limit]
+    unexpected_preview = unexpected_keys[:preview_limit]
+
+    LOGGER.info(
+        "Transfer learning load summary from %s: checkpoint_params=%d, exact_matches=%d, partial_matches=%d, "
+        "skipped_missing_target=%d, skipped_different_ndim=%d, skipped_missing_growth_key=%d, "
+        "skipped_missing_allowed_growth=%d, skipped_shape_mismatch=%d",
+        ckpt_path,
+        checkpoint_param_count,
+        exact_match_count,
+        partial_load_count,
+        skipped_missing_target_count,
+        skipped_different_ndim_count,
+        skipped_missing_growth_key_count,
+        skipped_missing_allowed_growth_count,
+        skipped_shape_mismatch_count,
+    )
+
+    if partial_loaded_preview:
+        LOGGER.info("Partially loaded parameters (first %d): %s", len(partial_loaded_preview), partial_loaded_preview)
+    if skipped_missing_target_preview:
+        LOGGER.info(
+            "Skipped (missing in target model) parameters (first %d): %s",
+            len(skipped_missing_target_preview),
+            skipped_missing_target_preview,
+        )
+    if skipped_different_ndim_preview:
+        LOGGER.info(
+            "Skipped (different ndim) parameters (first %d): %s",
+            len(skipped_different_ndim_preview),
+            skipped_different_ndim_preview,
+        )
+    if skipped_missing_growth_key_preview:
+        LOGGER.info(
+            "Skipped (no growth key rule) parameters (first %d): %s",
+            len(skipped_missing_growth_key_preview),
+            skipped_missing_growth_key_preview,
+        )
+    if skipped_missing_allowed_growth_preview:
+        LOGGER.info(
+            "Skipped (growth key missing in config) parameters (first %d): %s",
+            len(skipped_missing_allowed_growth_preview),
+            skipped_missing_allowed_growth_preview,
+        )
+    if skipped_shape_mismatch_preview:
+        LOGGER.info(
+            "Skipped (shape mismatch) parameters (first %d): %s",
+            len(skipped_shape_mismatch_preview),
+            skipped_shape_mismatch_preview,
+        )
+
+    LOGGER.info(
+        "Model load_state_dict results: missing_keys=%d, unexpected_keys=%d",
+        len(missing_keys),
+        len(unexpected_keys),
+    )
+    if missing_preview:
+        LOGGER.info("Missing keys reported by load_state_dict (first %d): %s", len(missing_preview), missing_preview)
+    if unexpected_preview:
+        LOGGER.info(
+            "Unexpected keys reported by load_state_dict (first %d): %s",
+            len(unexpected_preview),
+            unexpected_preview,
+        )
+
     # Needed for data indices check - data_indices is a dict[str, IndexCollection]
     data_indices = checkpoint["hyper_parameters"]["data_indices"]
     if isinstance(data_indices, dict):
@@ -269,7 +373,7 @@ def transfer_learning_loading(
     return model
 
 
-def freeze_submodule_by_name(module: nn.Module, target_name: str) -> None:
+def freeze_submodule_by_name(module: nn.Module, target_name: str) -> dict[str, Any]:
     """Recursively freezes the parameters of a submodule with the specified name.
 
     Parameters
@@ -278,15 +382,76 @@ def freeze_submodule_by_name(module: nn.Module, target_name: str) -> None:
         Pytorch model
     target_name : str
         The name of the submodule to freeze.
+
+    Returns
+    -------
+    dict[str, Any]
+        Summary of freeze operations, including matched module paths and
+        frozen parameter names.
     """
-    for name, child in module.named_children():
-        # If this is the target submodule, freeze its parameters
-        if name == target_name:
-            for param in child.parameters():
-                param.requires_grad = False
-        else:
-            # Recursively search within children
-            freeze_submodule_by_name(child, target_name)
+    preview_limit = 20
+    matched_module_paths: list[str] = []
+    frozen_parameter_names: list[str] = []
+    frozen_parameter_count = 0
+    frozen_parameter_elements = 0
+    visited_param_ids: set[int] = set()
+
+    def _freeze_submodule(current_module: nn.Module, module_path: str) -> None:
+        nonlocal frozen_parameter_count
+        nonlocal frozen_parameter_elements
+
+        for child_name, child_module in current_module.named_children():
+            child_path = f"{module_path}.{child_name}" if module_path else child_name
+
+            if child_name == target_name:
+                matched_module_paths.append(child_path)
+
+                for param_name, param in child_module.named_parameters(recurse=True):
+                    param_id = id(param)
+                    if param_id in visited_param_ids:
+                        continue
+
+                    visited_param_ids.add(param_id)
+                    param.requires_grad = False
+                    frozen_parameter_count += 1
+                    frozen_parameter_elements += int(param.numel())
+
+                    if len(frozen_parameter_names) < preview_limit:
+                        full_param_name = f"{child_path}.{param_name}" if param_name else child_path
+                        frozen_parameter_names.append(full_param_name)
+            else:
+                _freeze_submodule(child_module, child_path)
+
+    _freeze_submodule(module, "")
+
+    if matched_module_paths:
+        LOGGER.info(
+            "Froze %d parameter tensors (%d total elements) across %d submodule(s) named '%s'",
+            frozen_parameter_count,
+            frozen_parameter_elements,
+            len(matched_module_paths),
+            target_name,
+        )
+        LOGGER.info(
+            "Matched submodule paths (first %d): %s",
+            min(preview_limit, len(matched_module_paths)),
+            matched_module_paths[:preview_limit],
+        )
+        LOGGER.info(
+            "Frozen parameter names (first %d): %s",
+            len(frozen_parameter_names),
+            frozen_parameter_names,
+        )
+    else:
+        LOGGER.warning("No submodule named '%s' found to freeze", target_name)
+
+    return {
+        "target_name": target_name,
+        "matched_module_paths": matched_module_paths,
+        "frozen_parameter_count": frozen_parameter_count,
+        "frozen_parameter_elements": frozen_parameter_elements,
+        "frozen_parameter_preview": frozen_parameter_names,
+    }
 
 
 class LoggingUnpickler(pickle.Unpickler):
