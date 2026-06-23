@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 from typing import Optional
@@ -67,6 +68,24 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
             self.target_grid_size,
             self.source_grid_size,
         )
+
+    def __deepcopy__(self, memo: dict[int, Any]) -> MatrixRegridder:
+        """Deep-copy config/state without deep-copying the cached sparse matrix.
+
+        The sparse CSR cache is lazily reloaded in each copy, which avoids
+        `SparseCsrTensorImpl` storage deepcopy limitations.
+        """
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+
+        for key, value in self.__dict__.items():
+            if key == "regrid_matrix":
+                setattr(result, key, None)
+                continue
+            setattr(result, key, copy.deepcopy(value, memo))
+
+        return result
 
     @staticmethod
     def _as_plain(value: Any) -> Any:
