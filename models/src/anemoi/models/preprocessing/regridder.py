@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any
 from typing import Optional
@@ -53,9 +54,10 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
         self.nan_safe = bool(config.get("nan_safe", False))
         self.min_valid_weight = float(config.get("min_valid_weight", 1e-12))
 
-        self.regrid_matrix = self._load_matrix(self.matrix_path)
-        self.source_grid_size = int(self.regrid_matrix.shape[1])
-        self.target_grid_size = int(self.regrid_matrix.shape[0])
+        self.regrid_matrix = None
+        self.target_grid_size, self.source_grid_size = self._load_matrix_shape(self.matrix_path)
+        self.changes_grid_size = True
+        self._validate_matrix_shape_against_configured_nodes(config)
 
         # Useful for future sharding logic that needs to detect grid-changing preprocessors.
         self.changes_grid_size = True
@@ -67,13 +69,35 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
             self.source_grid_size,
         )
 
-        self._validate_matrix_shape_against_configured_nodes(config)
+    def __deepcopy__(self, memo: dict[int, Any]) -> MatrixRegridder:
+        """Deep-copy config/state without deep-copying the cached sparse matrix.
+
+        The sparse CSR cache is lazily reloaded in each copy, which avoids
+        `SparseCsrTensorImpl` storage deepcopy limitations.
+        """
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+
+        for key, value in self.__dict__.items():
+            if key == "regrid_matrix":
+                setattr(result, key, None)
+                continue
+            setattr(result, key, copy.deepcopy(value, memo))
+
+        return result
 
     @staticmethod
     def _as_plain(value: Any) -> Any:
         if isinstance(value, DictConfig):
             return OmegaConf.to_container(value, resolve=True)
         return value
+
+    @staticmethod
+    def _load_matrix_shape(path: str) -> tuple[int, int]:
+        with np.load(path, allow_pickle=False) as loaded:
+            shape = tuple(np.asarray(loaded["matrix_shape"], dtype=np.int64).tolist())
+        return shape
 
     @staticmethod
     def _load_matrix(path: str) -> torch.Tensor:
@@ -188,6 +212,9 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
             )
 
     def _matrix_for(self, x2d: torch.Tensor) -> torch.Tensor:
+        if self.regrid_matrix is None:
+            self.regrid_matrix = self._load_matrix(self.matrix_path)
+
         matrix = self.regrid_matrix
         if matrix.device != x2d.device or matrix.dtype != x2d.dtype:
             matrix = matrix.to(device=x2d.device, dtype=x2d.dtype)
