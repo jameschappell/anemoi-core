@@ -722,7 +722,10 @@ class PlotLoss(BasePerBatchPlotCallback):
                         y_hat,
                         y_true,
                         pred_layout=IndexSpace.MODEL_OUTPUT,
-                        target_layout=IndexSpace.DATA_FULL,
+                        # Plot callbacks evaluate loss on the already model-aligned
+                        # prediction tensor, so map targets to model-output layout
+                        # to keep grid/variable dimensions consistent.
+                        target_layout=IndexSpace.MODEL_OUTPUT,
                         squash=False,
                     )
                     .detach()
