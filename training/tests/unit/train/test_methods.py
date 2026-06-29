@@ -229,6 +229,149 @@ _CFG_EMPTY = DictConfig({})
 _CFG_DIFFUSION = DictConfig({"model": {"model": {"diffusion": {"rho": 7.0}}}})
 
 
+# ── BaseTrainingModule: allgather_batch ───────────────────────────────────────
+
+
+def test_allgather_batch_reader_layout_uses_reader_shards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """allgather_batch(layout='reader') must gather with reader shard sizes and reader group."""
+    module = MagicMock(spec=BaseTrainingModule)
+    module.grid_dim = -2
+
+    module.reader_shard_sizes = {"data": [3, 2]}
+    module.reader_grid_sizes = {"data": 5}
+    module.reader_group_size = 2
+    module.reader_group_id = 0
+    module.reader_groups = ["reader_group_0"]
+
+    module.grid_shard_sizes = {"data": [2, 2]}
+    module.shard_sizes = {"data": [2, 2]}
+    module.grid_sizes = {"data": 4}
+    module.model_comm_group_size = 2
+    module.model_comm_group = "model_group"
+
+    captured: dict[str, Any] = {}
+
+    def _fake_gather(input_: torch.Tensor, dim: int, sizes: list[int], group: Any) -> torch.Tensor:
+        captured["dim"] = dim
+        captured["sizes"] = sizes
+        captured["group"] = group
+        return input_ + 1.0
+
+    monkeypatch.setattr(
+        "anemoi.training.train.methods.base.gather_tensor",
+        _fake_gather,
+        raising=True,
+    )
+
+    x = torch.randn(1, 1, 3, 2)
+    out = BaseTrainingModule.allgather_batch(module, x, "data", layout="reader")
+
+    torch.testing.assert_close(out, x + 1.0)
+    assert captured["dim"] == -2
+    assert captured["sizes"] == [3, 2]
+    assert captured["group"] == "reader_group_0"
+
+
+def test_allgather_batch_model_layout_uses_model_shards_with_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """allgather_batch(layout='model') must use model shard sizes and model group."""
+    module = MagicMock(spec=BaseTrainingModule)
+    module.grid_dim = -2
+
+    module.reader_shard_sizes = {"data": [3, 2]}
+    module.reader_grid_sizes = {"data": 5}
+    module.reader_group_size = 2
+    module.reader_group_id = 0
+    module.reader_groups = ["reader_group_0"]
+
+    # Exercise fallback to self.shard_sizes when self.grid_shard_sizes[dataset] is None.
+    module.grid_shard_sizes = {"data": None}
+    module.shard_sizes = {"data": [2, 3]}
+    module.grid_sizes = {"data": 5}
+    module.model_comm_group_size = 2
+    module.model_comm_group = "model_group"
+
+    captured: dict[str, Any] = {}
+
+    def _fake_gather(input_: torch.Tensor, dim: int, sizes: list[int], group: Any) -> torch.Tensor:
+        captured["dim"] = dim
+        captured["sizes"] = sizes
+        captured["group"] = group
+        return input_ * 2.0
+
+    monkeypatch.setattr(
+        "anemoi.training.train.methods.base.gather_tensor",
+        _fake_gather,
+        raising=True,
+    )
+
+    x = torch.randn(1, 1, 2, 2)
+    out = BaseTrainingModule.allgather_batch(module, x, "data", layout="model")
+
+    torch.testing.assert_close(out, x * 2.0)
+    assert captured["dim"] == -2
+    assert captured["sizes"] == [2, 3]
+    assert captured["group"] == "model_group"
+
+
+def test_allgather_batch_model_layout_skips_on_grid_size_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """allgather_batch(layout='model') should skip gather when tensor grid size is not a shard size."""
+    module = MagicMock(spec=BaseTrainingModule)
+    module.grid_dim = -2
+
+    module.reader_shard_sizes = {"data": [3, 2]}
+    module.reader_grid_sizes = {"data": 5}
+    module.reader_group_size = 2
+    module.reader_group_id = 0
+    module.reader_groups = ["reader_group_0"]
+
+    module.grid_shard_sizes = {"data": [2, 3]}
+    module.shard_sizes = {"data": [2, 3]}
+    module.grid_sizes = {"data": 5}
+    module.model_comm_group_size = 2
+    module.model_comm_group = "model_group"
+
+    def _gather_should_not_be_called(*args: Any, **kwargs: Any) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("gather_tensor should not be called for mismatched grid size")
+
+    monkeypatch.setattr(
+        "anemoi.training.train.methods.base.gather_tensor",
+        _gather_should_not_be_called,
+        raising=True,
+    )
+
+    x = torch.randn(1, 1, 4, 2)  # grid dim is 4, not in [2, 3]
+    out = BaseTrainingModule.allgather_batch(module, x, "data", layout="model")
+
+    assert out is x
+
+
+def test_allgather_batch_rejects_invalid_layout() -> None:
+    """allgather_batch should fail fast for unsupported layout values."""
+    module = MagicMock(spec=BaseTrainingModule)
+    module.grid_dim = -2
+    module.reader_shard_sizes = {"data": None}
+    module.reader_grid_sizes = {"data": 1}
+    module.reader_group_size = 1
+    module.reader_group_id = 0
+    module.reader_groups = None
+    module.grid_shard_sizes = {"data": None}
+    module.shard_sizes = {"data": None}
+    module.grid_sizes = {"data": 1}
+    module.model_comm_group_size = 1
+    module.model_comm_group = None
+
+    x = torch.randn(1, 1, 1, 1)
+    with pytest.raises(ValueError, match="Invalid layout"):
+        BaseTrainingModule.allgather_batch(module, x, "data", layout="invalid")
+
+
 # ── BaseTrainingModule: _compute_loss ──────────────────────────────────────────
 
 

@@ -926,18 +926,50 @@ class BaseTrainingModule(pl.LightningModule, ABC):
     ) -> tuple[torch.Tensor, Mapping[str, torch.Tensor], list[dict[str, torch.Tensor]]]:
         pass
 
-    def allgather_batch(self, batch: torch.Tensor, dataset_name: str) -> torch.Tensor:
-        grid_shard_sizes = self.reader_shard_sizes.get(dataset_name)
-        grid_size = self.reader_grid_sizes.get(dataset_name, batch.shape[self.grid_dim])
+    def allgather_batch(self, batch: torch.Tensor, dataset_name: str, layout: str = "reader") -> torch.Tensor:
+        if layout not in {"reader", "model"}:
+            raise ValueError(f"Invalid layout '{layout}'. Expected 'reader' or 'model'.")
 
-        if grid_shard_sizes is None or self.reader_group_size == 1 or grid_size == batch.shape[self.grid_dim]:
-            return batch  # already full reader-layout tensor
+        if layout == "reader":
+            grid_shard_sizes = self.reader_shard_sizes.get(dataset_name)
+            grid_size = self.reader_grid_sizes.get(dataset_name, batch.shape[self.grid_dim])
+            comm_group_size = self.reader_group_size
+            comm_group = self.reader_groups[self.reader_group_id] if self.reader_groups is not None else None
+        else:
+            # Plot callbacks operate on model-layout tensors after preprocessing/sharding.
+            grid_shard_sizes = self.grid_shard_sizes.get(dataset_name)
+            if grid_shard_sizes is None:
+                grid_shard_sizes = self.shard_sizes.get(dataset_name)
+            grid_size = self.grid_sizes.get(dataset_name, batch.shape[self.grid_dim])
+            comm_group_size = self.model_comm_group_size
+            comm_group = self.model_comm_group
+
+        if (
+            grid_shard_sizes is None
+            or comm_group is None
+            or comm_group_size == 1
+            or grid_size == batch.shape[self.grid_dim]
+        ):
+            return batch
+
+        current_grid = int(batch.shape[self.grid_dim])
+        if current_grid not in set(grid_shard_sizes):
+            LOGGER.warning(
+                "Skipping allgather for dataset=%s layout=%s due to grid-size mismatch "
+                "(tensor=%d, shard_sizes=%s, full=%d).",
+                dataset_name,
+                layout,
+                current_grid,
+                grid_shard_sizes,
+                int(grid_size),
+            )
+            return batch
 
         return gather_tensor(
             batch,
             self.grid_dim,
             grid_shard_sizes,
-            self.reader_groups[self.reader_group_id],
+            comm_group,
         )
 
     def calculate_val_metrics(

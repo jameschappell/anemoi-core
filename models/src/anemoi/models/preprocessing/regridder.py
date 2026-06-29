@@ -13,6 +13,7 @@ from einops import rearrange
 from hydra.utils import instantiate
 from omegaconf import DictConfig
 from omegaconf import OmegaConf
+from torch.amp.autocast_mode import autocast
 
 from anemoi.models.data_indices.collection import IndexCollection
 from anemoi.models.preprocessing import ForwardOnlyPreProcessor
@@ -224,6 +225,11 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
     @staticmethod
     def _left_sparse_mm(matrix: torch.Tensor, x2d: torch.Tensor) -> torch.Tensor:
         # matrix: [n_target, n_source], x2d: [N, n_source] -> [N, n_target]
+        if x2d.is_cuda:
+            # Sparse kernels can be unstable under mixed-precision autocast on some stacks.
+            with autocast("cuda", enabled=False):
+                return torch.sparse.mm(matrix, x2d.transpose(0, 1)).transpose(0, 1)
+
         return torch.sparse.mm(matrix, x2d.transpose(0, 1)).transpose(0, 1)
 
     def _apply_matrix(self, x2d: torch.Tensor) -> torch.Tensor:
