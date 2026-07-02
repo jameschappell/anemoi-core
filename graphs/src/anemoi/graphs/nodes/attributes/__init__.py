@@ -14,15 +14,16 @@ from .area_weights import MaskedPlanarAreaWeights
 from .area_weights import PlanarAreaWeights
 from .area_weights import SphericalAreaWeights
 from .area_weights import UniformWeights
+from .boolean_op import AllNodesMask
 from .boolean_op import BooleanAndMask
 from .boolean_op import BooleanNot
 from .boolean_op import BooleanOrMask
 from .masks import CutOutMask
+from .masks import GlobalResolutionMask
 from .masks import GridsMask
 from .masks import LimitedAreaMask
 from .masks import NonmissingAnemoiDatasetVariable
 from .masks import NonzeroAnemoiDatasetVariable
-from .masks import GlobalResolutionMask
 
 __all__ = [
     "GridsMask",
@@ -37,6 +38,7 @@ __all__ = [
     "BooleanAndMask",
     "BooleanNot",
     "BooleanOrMask",
+    "AllNodesMask",
     "CosineLatWeightedAttribute",
     "IsolatitudeAreaWeights",
     "AnemoiDatasetVariableWeights",

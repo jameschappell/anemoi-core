@@ -6,7 +6,6 @@ import torch
 from requests.exceptions import HTTPError
 
 from anemoi.graphs.generate.masks import KNNAreaMaskBuilder
-from anemoi.graphs.generate.utils import get_coordinates_ordering
 from anemoi.utils.grids import grids
 
 LOGGER = logging.getLogger(__name__)
@@ -48,9 +47,7 @@ def get_latlon_coords_gaussian(grid: str) -> np.ndarray:
 
 
 def octahedral_reduced_gaussian_gridpoints(n_points=96, dtype=np.float64):
-    """
-    Generate coordinates for the ECMWF octahedral reduced Gaussian grid.
-    """
+    """Generate coordinates for the ECMWF octahedral reduced Gaussian grid."""
     N = n_points * 2
 
     # Gaussian latitudes (north -> south)
@@ -65,11 +62,12 @@ def octahedral_reduced_gaussian_gridpoints(n_points=96, dtype=np.float64):
     lats = np.repeat(gauss_lats, nlons)
 
     n_total = int(nlons.sum())
-    starts = np.cumsum(np.r_[0, nlons[:-1]])      # start index per latitude ring
+    starts = np.cumsum(np.r_[0, nlons[:-1]])  # start index per latitude ring
     idx_in_ring = np.arange(n_total) - np.repeat(starts, nlons)
     nlon_per_point = np.repeat(nlons, nlons)
 
     lons = (idx_in_ring * (360.0 / nlon_per_point)).astype(dtype, copy=False)
+    lons = np.where(lons > 180.0, lons - 360.0, lons)  # convert to [-180, 180]
     return lats, lons
 
 
@@ -126,8 +124,9 @@ def create_stretched_reduced_gaussian_nodes(
 
     return torch.tensor(combined_coords[node_ordering], dtype=torch.float32)
 
+
 def get_coordinates_ordering_stable(coords: np.ndarray) -> np.ndarray:
-    index_latitude = np.argsort(coords[:, 1])                      # sort by lon (secondary key)
-    index_longitude = np.argsort(-coords[index_latitude][:, 0], kind='stable')  # sort by lat desc (primary key)
+    index_latitude = np.argsort(coords[:, 1])  # sort by lon (secondary key)
+    index_longitude = np.argsort(-coords[index_latitude][:, 0], kind="stable")  # sort by lat desc (primary key)
     node_ordering = np.arange(coords.shape[0])[index_latitude][index_longitude]
     return node_ordering

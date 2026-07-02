@@ -69,3 +69,10 @@ class BooleanOrMask(BooleanOperation):
 
     def reduce_op(self, masks: list[torch.Tensor]) -> torch.Tensor:
         return torch.any(masks, dim=0)
+
+
+class AllNodesMask(BooleanBaseNodeAttribute):
+    """Mask that includes all nodes."""
+
+    def get_raw_values(self, nodes: NodeStorage, **kwargs) -> torch.Tensor:
+        return torch.ones(nodes.num_nodes, dtype=torch.bool)
