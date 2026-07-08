@@ -18,7 +18,7 @@ from abc import abstractmethod
 import torch
 from torch_geometric.data import HeteroData
 
-from anemoi.graphs.generate.masks import KNNAreaMaskBuilder
+from anemoi.graphs.generate.masks import AreaMaskBuilder
 from anemoi.graphs.generate.reduced_gaussian import get_latlon_coords_gaussian
 from anemoi.graphs.nodes.builders.base import BaseNodeBuilder
 
@@ -110,7 +110,7 @@ class LimitedAreaReducedGaussianGridNodes(ReducedGaussianGridNodes, ABC):
 
     Attributes
     ----------
-    area_mask_builder : KNNAreaMaskBuilder
+    area_mask_builder : AreaMaskBuilder
         The area of interest mask builder.
     """
 
@@ -126,7 +126,7 @@ class LimitedAreaReducedGaussianGridNodes(ReducedGaussianGridNodes, ABC):
         super().__init__(grid, name)
         self.hidden_attributes = self.hidden_attributes | {"area_mask_builder"}
 
-        self.area_mask_builder = KNNAreaMaskBuilder(reference_node_name, margin_radius_km, mask_attr_name)
+        self.area_mask_builder = AreaMaskBuilder(reference_node_name, margin_radius_km, mask_attr_name)
 
     def register_nodes(self, graph: HeteroData) -> None:
         self.area_mask_builder.fit(graph)
@@ -139,7 +139,7 @@ class StretchedReducedGaussianGridNodes(LimitedAreaReducedGaussianGridNodes, ABC
 
     Attributes
     ----------
-    area_mask_builder : KNNAreaMaskBuilder
+    area_mask_builder : AreaMaskBuilder
         The area of interest mask builder.
     """
 

@@ -5,7 +5,7 @@ import numpy as np
 import torch
 from requests.exceptions import HTTPError
 
-from anemoi.graphs.generate.masks import KNNAreaMaskBuilder
+from anemoi.graphs.generate.masks import AreaMaskBuilder
 from anemoi.utils.grids import grids
 
 LOGGER = logging.getLogger(__name__)
@@ -74,7 +74,7 @@ def octahedral_reduced_gaussian_gridpoints(n_points=96, dtype=np.float64):
 def create_stretched_reduced_gaussian_nodes(
     global_grid: str,
     lam_grid: str,
-    area_mask_builder: KNNAreaMaskBuilder,
+    area_mask_builder: AreaMaskBuilder,
 ) -> torch.Tensor:
     """Creates nodes from two reduced gaussian grids with different resolutions.
 
@@ -87,8 +87,8 @@ def create_stretched_reduced_gaussian_nodes(
         Global (coarser) reduced gaussian grid identifier, e.g. 'O96'.
     lam_grid : str
         LAM (higher resolution) reduced gaussian grid identifier, e.g. 'O320'.
-    area_mask_builder : KNNAreaMaskBuilder
-        KNNAreaMaskBuilder with the cloud of points to define the AOI.
+    area_mask_builder : AreaMaskBuilder
+        AreaMaskBuilder with the cloud of points to define the AOI.
 
     Returns
     -------
