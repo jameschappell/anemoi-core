@@ -1,4 +1,4 @@
-# (C) Copyright 2024 Anemoi contributors.
+# (C) Copyright 2024-2026 Anemoi contributors.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
@@ -283,7 +283,15 @@ class ComponentCatalog:
 
     @classmethod
     def _get_loaders(cls) -> dict[str, str]:
-        """Get the registry of loaders, discovering if needed."""
+        """Get the registry of loaders, discovering if needed.
+
+        The ``anemoi.training.checkpoint.loading`` package ships the
+        ``LoadingStrategy`` base class but no concrete strategies in this
+        revision — concrete loaders (``WeightsOnlyLoader``, ``ColdStartLoader``,
+        ``TransferLearningLoader``, ``WarmStartLoader``) are introduced in
+        ``anemoi-core`` PR #998. Until that lands, this discovery returns an
+        empty registry; a discovery warning is therefore expected.
+        """
         if cls._loaders is None:
             cls._loaders = cls._discover_components("anemoi.training.checkpoint.loading", "LoadingStrategy")
             cls._warn_about_discovery_issues("loaders", cls._loaders)
@@ -291,7 +299,14 @@ class ComponentCatalog:
 
     @classmethod
     def _get_modifiers(cls) -> dict[str, str]:
-        """Get the registry of modifiers, discovering if needed."""
+        """Get the registry of modifiers, discovering if needed.
+
+        The ``anemoi.training.checkpoint.modifiers`` package is populated by
+        ``anemoi-core`` PR #442, which introduces ``FreezingModifierStage``
+        and the rest of the model-transformation layer. Until that lands,
+        this discovery returns an empty registry; a discovery warning is
+        therefore expected.
+        """
         if cls._modifiers is None:
             cls._modifiers = cls._discover_components("anemoi.training.checkpoint.modifiers", "ModelModifier")
             cls._warn_about_discovery_issues("modifiers", cls._modifiers)

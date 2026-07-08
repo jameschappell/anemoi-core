@@ -1,4 +1,4 @@
-# (C) Copyright 2024 Anemoi contributors.
+# (C) Copyright 2024-2026 Anemoi contributors.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
@@ -41,22 +41,8 @@ from .utils import estimate_checkpoint_memory
 from .utils import format_size
 from .utils import get_checkpoint_metadata
 from .utils import validate_checkpoint
-
-# Import validation utilities with graceful fallback
-try:
-    from .validation import validate_pipeline_health
-except ImportError:
-    from typing import NoReturn
-
-    def validate_pipeline_health(*_args: object, **_kwargs: object) -> NoReturn:  # type: ignore[misc]
-        """Sentinel: raise when the validation module is unavailable."""
-        msg = (
-            "validate_pipeline_health is not available because the "
-            "validation module could not be imported. Ensure that "
-            "anemoi.training.checkpoint.validation is installed."
-        )
-        raise ImportError(msg)
-
+from .validation import CheckpointPipelineValidator
+from .validation import validate_pipeline_health
 
 __all__ = [
     # Exceptions
@@ -68,6 +54,7 @@ __all__ = [
     "CheckpointLoadError",
     "CheckpointNotFoundError",
     "CheckpointPipeline",
+    "CheckpointPipelineValidator",
     "CheckpointSourceError",
     "CheckpointTimeoutError",
     "CheckpointValidationError",

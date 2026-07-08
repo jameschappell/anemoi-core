@@ -1,4 +1,4 @@
-# (C) Copyright 2024 Anemoi contributors.
+# (C) Copyright 2024-2026 Anemoi contributors.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
@@ -23,11 +23,28 @@ from pytorch_lightning import Trainer
 
 from anemoi.models.migrations import Migrator
 from anemoi.training.train.methods.base import BaseTrainingModule
+from anemoi.training.utils.variables_metadata import extract_variables_metadata_from_checkpoint
 from anemoi.utils.checkpoints import save_metadata
 
 chunking_fix_migration = importlib.import_module("anemoi.models.migrations.scripts.1762857428_chunking_fix").migrate
+trainable_edge_perm_fix_migration = importlib.import_module(
+    "anemoi.models.migrations.scripts.1779202136_trainable_edge_perm_fix",
+).migrate
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _filter_state_dict_size_mismatches(
+    state_dict: dict[str, torch.Tensor],
+    model_state_dict: dict[str, torch.Tensor],
+) -> None:
+    for key in list(state_dict):
+        if key in model_state_dict and state_dict[key].shape != model_state_dict[key].shape:
+            LOGGER.info("Skipping loading parameter: %s", key)
+            LOGGER.info("Checkpoint shape: %s", str(state_dict[key].shape))
+            LOGGER.info("Model shape: %s", str(model_state_dict[key].shape))
+
+            del state_dict[key]
 
 
 def load_and_prepare_model(lightning_checkpoint_path: str) -> tuple[torch.nn.Module, dict]:
@@ -182,8 +199,11 @@ def transfer_learning_loading(
             container.append(value)
 
     # Load the checkpoint
-    LOGGER.debug("Loading checkpoint to device: %s", model.device)
-    checkpoint = torch.load(ckpt_path, weights_only=False, map_location=model.device)
+    # Load to CPU explictly, to avoid loading entire model on GPU initially
+    # Modifications to the model occur on cpu,
+    # The model will be sent to GPU when trainer.fit() is called
+    LOGGER.debug("Loading checkpoint to device: cpu")
+    checkpoint = torch.load(ckpt_path, weights_only=False, map_location="cpu")
 
     # apply chunking migration (fails silently otherwise leading to hard to debug issues)
     # this is due to loading with strict=False, planning to make this more robust in the future
@@ -197,6 +217,11 @@ def transfer_learning_loading(
 
     # check whether sizes of components are compatible, either matching or differing by
     # trainable_parameters
+    state_dict = checkpoint["state_dict"]
+    _filter_state_dict_size_mismatches(state_dict, model.state_dict())
+
+    # Runtime migration: the graph-provider permutation depends on instantiated provider state.
+    checkpoint = trainable_edge_perm_fix_migration(checkpoint, model)
     state_dict = checkpoint["state_dict"]
     checkpoint_param_count = len(state_dict)
 
@@ -368,8 +393,20 @@ def transfer_learning_loading(
             k: v.name_to_index for k, v in data_indices.items() if hasattr(v, "name_to_index")
         }
     else:
-        # Legacy single-dataset format
-        model._ckpt_model_name_to_index = data_indices.name_to_index
+        # Old format: data_indices is a single IndexCollection object (not dict)
+        msg = (
+            f"Checkpoint at '{ckpt_path}' was created with an older version of anemoi-core "
+            "that does not support multi-dataset training. This checkpoint is incompatible "
+            "with transfer learning in the current version."
+        )
+        raise TypeError(msg)
+
+    # Extract variables_metadata for unit compatibility check
+    model._ckpt_variables_metadata = extract_variables_metadata_from_checkpoint(
+        checkpoint,
+        model._ckpt_model_name_to_index,
+    )
+
     return model
 
 

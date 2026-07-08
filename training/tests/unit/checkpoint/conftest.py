@@ -1,4 +1,4 @@
-# (C) Copyright 2024 Anemoi contributors.
+# (C) Copyright 2024-2026 Anemoi contributors.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
@@ -177,6 +177,15 @@ def temp_checkpoint_dir(tmp_path: Path) -> Path:
     checkpoint_dir = tmp_path / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     return checkpoint_dir
+
+
+@pytest.fixture
+def sample_checkpoint(tmp_path: Path) -> Path:
+    """Write a minimal on-disk checkpoint for source/loading round-trip tests."""
+    ckpt_path = tmp_path / "test.ckpt"
+    state = {"state_dict": {"layer.weight": torch.randn(10, 5)}, "epoch": 3}
+    torch.save(state, ckpt_path)
+    return ckpt_path
 
 
 @pytest.fixture

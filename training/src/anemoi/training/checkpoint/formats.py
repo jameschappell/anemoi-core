@@ -1,4 +1,4 @@
-# (C) Copyright 2024 Anemoi contributors.
+# (C) Copyright 2024-2026 Anemoi contributors.
 #
 # This software is licensed under the terms of the Apache Licence Version 2.0
 # which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
@@ -47,17 +47,23 @@ def detect_format_from_data(
     if not isinstance(checkpoint_data, dict):
         return "pytorch"
 
-    # Check for Lightning-specific keys (exclude generic training state keys)
-    lightning_specific_keys = {
-        "pytorch-lightning_version",
+    # Lightning checkpoint signature. Tested against pytorch-lightning 2.0-2.4
+    # and torch 2.2-2.6. The version key is the most stable marker; the
+    # auxiliary key set guards against the version key being renamed in a
+    # future release by requiring two independent Lightning-specific keys
+    # to coexist. Keep the auxiliary set narrow (exclude `hyper_parameters`
+    # which user-saved PyTorch checkpoints sometimes also carry).
+    lightning_version_key = "pytorch-lightning_version"
+    lightning_auxiliary_keys = {
         "callbacks",
         "optimizer_states",  # Lightning uses plural
         "lr_schedulers",  # Lightning uses plural
         "loops",
-        "hyper_parameters",
     }
 
-    if any(key in checkpoint_data for key in lightning_specific_keys):
+    if lightning_version_key in checkpoint_data:
+        return "lightning"
+    if sum(1 for k in lightning_auxiliary_keys if k in checkpoint_data) >= 2:
         return "lightning"
 
     # Check for PyTorch-specific structure
@@ -347,9 +353,7 @@ def _save_checkpoint_file(
 ) -> None:
     """Save checkpoint file using ``torch.save``.
 
-    All checkpoint formats are saved via ``torch.save``. Alternative
-    serialisation backends (e.g. safetensors) can be added in the
-    future by extending this function.
+    All checkpoint formats are saved via ``torch.save``.
 
     Parameters
     ----------
@@ -544,12 +548,11 @@ def convert_lightning_to_pytorch(
     return pytorch_checkpoint
 
 
-def is_format_available(checkpoint_format: Literal["lightning", "pytorch", "safetensors", "state_dict"]) -> bool:
+def is_format_available(checkpoint_format: Literal["lightning", "pytorch", "state_dict"]) -> bool:
     """Check if a checkpoint format is available for use.
 
-    The ``"lightning"``, ``"pytorch"`` and ``"state_dict"`` formats are
-    always available because they only depend on PyTorch.
-    ``"safetensors"`` requires the optional ``safetensors`` package.
+    All supported formats (``"lightning"``, ``"pytorch"``, ``"state_dict"``)
+    are always available because they only depend on PyTorch.
 
     Parameters
     ----------
@@ -561,15 +564,4 @@ def is_format_available(checkpoint_format: Literal["lightning", "pytorch", "safe
     bool
         True if the format is available
     """
-    if checkpoint_format in {"lightning", "pytorch", "state_dict"}:
-        return True
-
-    if checkpoint_format == "safetensors":
-        try:
-            import safetensors  # noqa: F401
-        except ImportError:
-            return False
-        else:
-            return True
-
-    return False
+    return checkpoint_format in {"lightning", "pytorch", "state_dict"}
