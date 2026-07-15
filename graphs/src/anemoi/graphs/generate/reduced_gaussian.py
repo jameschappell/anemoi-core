@@ -1,3 +1,12 @@
+# (C) Copyright 2026 Anemoi contributors.
+#
+# This software is licensed under the terms of the Apache Licence Version 2.0
+# which can be obtained at http://www.apache.org/licenses/LICENSE-2.0.
+#
+# In applying this licence, ECMWF does not waive the privileges and immunities
+# granted to it by virtue of its status as an intergovernmental organisation
+# nor does it submit to any jurisdiction.
+
 import logging
 import re
 
@@ -10,6 +19,157 @@ from anemoi.utils.grids import grids
 
 LOGGER = logging.getLogger(__name__)
 
+try:
+    import eccodes
+except Exception as exc:
+    LOGGER.warning(
+        "ecCodes Python module is unavailable or failed to initialize (%s). " "Continuing without ecCodes fallback.",
+        exc,
+    )
+    eccodes = None
+
+
+def _parse_gaussian_grid(grid: str) -> tuple[str, int]:
+    match = re.match(r"^([NnOo])(\d+)$", grid)
+    if not match:
+        raise ValueError(f"Grid '{grid}' does not match expected format 'N{{n_points}}' or 'O{{n_points}}'.")
+    return match.group(1).upper(), int(match.group(2))
+
+
+def _as_numpy_1d(values, dtype):
+    """Robustly convert ecCodes return values (including cdata arrays) to 1-D NumPy arrays."""
+    if isinstance(values, np.ndarray):
+        return values.astype(dtype, copy=False).ravel()
+
+    try:
+        return np.asarray(values, dtype=dtype).ravel()
+    except Exception:
+        pass
+
+    try:
+        return np.asarray(list(values), dtype=dtype).ravel()
+    except Exception:
+        pass
+
+    try:
+        n = len(values)
+    except Exception as exc:
+        raise TypeError(f"Could not determine length of values of type {type(values)}") from exc
+
+    try:
+        return np.fromiter((values[i] for i in range(n)), dtype=dtype, count=n)
+    except Exception as exc:
+        raise TypeError(f"Could not convert values of type {type(values)} to numpy array") from exc
+
+
+def _latlon_from_pl(latitudes_deg, pl, dtype=np.float64):
+    latitudes_deg = _as_numpy_1d(latitudes_deg, dtype=dtype)
+    pl = _as_numpy_1d(pl, dtype=np.int64)
+
+    if latitudes_deg.size != pl.size:
+        raise ValueError(f"PL length mismatch: len(latitudes)={latitudes_deg.size}, len(pl)={pl.size}.")
+
+    lats = np.repeat(latitudes_deg, pl)
+
+    n_total = int(pl.sum())
+    starts = np.cumsum(np.r_[0, pl[:-1]])
+    idx_in_ring = np.arange(n_total) - np.repeat(starts, pl)
+    nlon_per_point = np.repeat(pl, pl)
+
+    lons = (idx_in_ring * (360.0 / nlon_per_point)).astype(dtype, copy=False)
+    lons = np.where(lons > 180.0, lons - 360.0, lons)
+    return lats, lons
+
+
+def _eccodes_latlon_coords(grid: str, dtype=np.float64):
+    if eccodes is None:
+        return None
+
+    try:
+        grid_type, n_points = _parse_gaussian_grid(grid)
+    except ValueError:
+        return None
+
+    try:
+        latitudes_deg = _as_numpy_1d(eccodes.codes_get_gaussian_latitudes(n_points), dtype=dtype)
+    except Exception as exc:
+        LOGGER.warning(
+            "ecCodes failed to get Gaussian latitudes for grid '%s': %s",
+            grid,
+            exc,
+        )
+        return None
+
+    expected_latitudes = 2 * n_points
+    if latitudes_deg.size != expected_latitudes:
+        LOGGER.warning(
+            "ecCodes returned %d latitudes for grid '%s'; expected %d.",
+            latitudes_deg.size,
+            grid,
+            expected_latitudes,
+        )
+        return None
+
+    if grid_type == "N":
+        sample_name = f"reduced_gg_pl_{n_points}_grib2"
+        gid = None
+        try:
+            gid = eccodes.codes_grib_new_from_samples(sample_name)
+            pl = _as_numpy_1d(eccodes.codes_get_array(gid, "pl"), dtype=np.int64)
+        except Exception as exc:
+            LOGGER.warning(
+                "ecCodes failed to read sample '%s' for grid '%s': %s",
+                sample_name,
+                grid,
+                exc,
+            )
+            return None
+        finally:
+            if gid is not None:
+                eccodes.codes_release(gid)
+    else:
+        nlons_half = 20 + 4 * np.arange(0, n_points, dtype=np.int64)
+        pl = np.concatenate([nlons_half, nlons_half[::-1]])
+
+    try:
+        return _latlon_from_pl(latitudes_deg, pl, dtype=dtype)
+    except Exception as exc:
+        LOGGER.warning(
+            "Failed to build coordinates from ecCodes data for grid '%s': %s",
+            grid,
+            exc,
+        )
+        return None
+
+
+def _stack_coords_radians(lats_deg, lons_deg) -> np.ndarray:
+    return np.stack([np.deg2rad(lats_deg), np.deg2rad(lons_deg)], axis=-1)
+
+
+def _local_octahedral_latlon_coords(grid: str):
+    try:
+        grid_type, n_points = _parse_gaussian_grid(grid)
+    except ValueError:
+        return None
+
+    if grid_type != "O":
+        return None
+
+    try:
+        LOGGER.warning(
+            "Falling back to local octahedral_reduced_gaussian_gridpoints(n_points=%d) for grid '%s'.",
+            n_points,
+            grid,
+        )
+        return octahedral_reduced_gaussian_gridpoints(n_points=n_points)
+    except Exception as exc:
+        LOGGER.warning(
+            "Local octahedral fallback failed for grid '%s': %s",
+            grid,
+            exc,
+        )
+        return None
+
 
 def get_latlon_coords_gaussian(grid: str) -> np.ndarray:
     """Get the latitude and longitude coordinates (in radians) of a reduced gaussian grid.
@@ -18,32 +178,40 @@ def get_latlon_coords_gaussian(grid: str) -> np.ndarray:
     ----------
     grid : str
         The reduced gaussian grid identifier, e.g. 'O96', 'N320'.
-        If the grid is not found in the registry and starts with 'O',
-        falls back to generating it locally via reduced_gaussian_gridpoints().
+        Resolution order: registry lookup -> local octahedral construction
+        for O-grids -> ecCodes fallback for N/O grids.
 
     Returns
     -------
     np.ndarray of shape (num_nodes, 2)
         The latitude and longitude coordinates, in radians.
     """
+    # 1) Primary registry lookup
     try:
         grid_data = grids(grid)
-        lats = np.deg2rad(grid_data["latitudes"])
-        lons = np.deg2rad(grid_data["longitudes"])
-    except HTTPError:
-        if not re.match(r"^[Oo]\d+$", grid):
-            raise ValueError(f"Grid '{grid}' not found in registry and does not match expected format 'O{{n_points}}'.")
-        n_points = int(re.match(r"^[Oo](\d+)$", grid).group(1))
+        return _stack_coords_radians(grid_data["latitudes"], grid_data["longitudes"])
+    except HTTPError as exc:
         LOGGER.warning(
-            "Grid '%s' not found in registry. Falling back to  octahedral_reduced_gaussian_gridpoints(n_points=%d).",
+            "Grid '%s' not found in registry (%s). Trying fallback methods.",
             grid,
-            n_points,
+            exc,
         )
-        lats_deg, lons_deg = octahedral_reduced_gaussian_gridpoints(n_points=n_points)
-        lats = np.deg2rad(lats_deg)
-        lons = np.deg2rad(lons_deg)
 
-    return np.stack([lats, lons], axis=-1)
+    # 2) Existing local octahedral fallback for O-grids
+    local_coords = _local_octahedral_latlon_coords(grid)
+    if local_coords is not None:
+        return _stack_coords_radians(*local_coords)
+
+    # 3) ecCodes fallback for N/O grids
+    eccodes_coords = _eccodes_latlon_coords(grid)
+    if eccodes_coords is not None:
+        LOGGER.warning(
+            "Using ecCodes fallback coordinates for grid '%s'.",
+            grid,
+        )
+        return _stack_coords_radians(*eccodes_coords)
+
+    raise ValueError(f"Grid '{grid}' could not be resolved from registry, local fallback, or ecCodes fallback.")
 
 
 def octahedral_reduced_gaussian_gridpoints(n_points=96, dtype=np.float64):
