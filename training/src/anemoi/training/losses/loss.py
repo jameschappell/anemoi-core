@@ -266,7 +266,7 @@ def get_loss_function(
             data_indices=data_indices,
         )
         loss_function.compatibility_options = dict(compatibility_options)
-    _apply_scalers(loss_function, scalers_to_include, scalers, data_indices)
+    _apply_scalers(loss_function, scalers_to_include, scalers, data_indices, statistics)
     return loss_function
 
 
