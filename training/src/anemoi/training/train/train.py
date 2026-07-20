@@ -44,6 +44,7 @@ from anemoi.training.diagnostics.logger import get_wandb_logger
 from anemoi.training.schemas.base_schema import BaseSchema
 from anemoi.training.schemas.base_schema import UnvalidatedBaseSchema
 from anemoi.training.schemas.base_schema import convert_to_omegaconf
+from anemoi.training.schemas.dataloader import DatasetConfigSchema
 from anemoi.training.tasks.base import BaseTask
 from anemoi.training.train.checkpoint_integration import has_checkpoint_pipeline_config
 from anemoi.training.train.checkpoint_integration import load_checkpoint_with_pipeline
@@ -224,7 +225,19 @@ class AnemoiTrainer(ABC):
                     and hasattr(data_node_cfg, "node_builder")
                     and hasattr(data_node_cfg.node_builder, "dataset")
                 ):
-                    data_node_cfg.node_builder.dataset = dataset_path
+                    # Build the dataset value for the graph node builder.
+                    # Start with the bare dataset path, then merge any keys from
+                    # dataset_config that are not part of DatasetConfigSchema
+                    # (e.g. check_variables_compatibility).  Schema-managed keys
+                    # are excluded to avoid forwarding complex validated objects
+                    # or None defaults (e.g. select: None, frequency: Frequency(...)).
+                    graph_dataset_value: str | dict = {"dataset": dataset_path}
+                    if isinstance(reader_cfg, (DictConfig, dict)):
+                        _schema_keys = set(DatasetConfigSchema.model_fields.keys())
+                        graph_dataset_value.update(
+                            {k: v for k, v in dict(reader_cfg).items() if k not in _schema_keys and v is not None},
+                        )
+                    data_node_cfg.node_builder.dataset = graph_dataset_value
             else:
                 msg = (
                     "Multiple datasets require a fused graph config with one node group per dataset. "
