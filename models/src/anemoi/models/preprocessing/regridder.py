@@ -32,6 +32,7 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
       - target_nodes: {node_builder: {_target_: ..., ...}} or {_target_: ..., ...}
       - source_num_nodes: int  # optional direct override
       - target_num_nodes: int  # optional direct override
+            - variable_chunk_size: int | null  # optional chunking over final vars axis
     """
 
     def __init__(
@@ -55,6 +56,13 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
         self.nan_safe = bool(config.get("nan_safe", False))
         self.min_valid_weight = float(config.get("min_valid_weight", 1e-12))
 
+        raw_variable_chunk_size = config.get("variable_chunk_size", None)
+        self.variable_chunk_size = int(raw_variable_chunk_size) if raw_variable_chunk_size is not None else None
+        if self.variable_chunk_size is not None and self.variable_chunk_size <= 0:
+            raise ValueError(
+                "MatrixRegridder config.variable_chunk_size must be a positive integer when provided"
+            )
+
         self.regrid_matrix = None
         self.target_grid_size, self.source_grid_size = self._load_matrix_shape(self.matrix_path)
         self.changes_grid_size = True
@@ -69,6 +77,11 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
             self.target_grid_size,
             self.source_grid_size,
         )
+        if self.variable_chunk_size is not None:
+            LOGGER.info(
+                "MatrixRegridder variable chunking enabled with variable_chunk_size=%d",
+                self.variable_chunk_size,
+            )
 
     def __deepcopy__(self, memo: dict[int, Any]) -> MatrixRegridder:
         """Deep-copy config/state without deep-copying the cached sparse matrix.
@@ -270,10 +283,32 @@ class MatrixRegridder(ForwardOnlyPreProcessor):
         leading_shape = x.shape[:-2]
         n_leading = int(np.prod(leading_shape, dtype=np.int64)) if leading_shape else 1
 
-        # [..., grid, vars] -> [(leading * vars), grid]
-        x2d = rearrange(x, "... grid vars -> (... vars) grid").contiguous()
-        y2d = self._apply_matrix(x2d)
+        variable_chunk_size = self.variable_chunk_size
+        if variable_chunk_size is None or variable_chunk_size >= n_vars:
+            # [..., grid, vars] -> [(leading * vars), grid]
+            x2d = rearrange(x, "... grid vars -> (... vars) grid").contiguous()
+            y2d = self._apply_matrix(x2d)
 
-        # [(leading * vars), new_grid] -> [leading, new_grid, vars] -> [..., new_grid, vars]
-        y = rearrange(y2d, "(lead vars) new_grid -> lead new_grid vars", lead=n_leading, vars=n_vars)
-        return y.reshape(*leading_shape, self.target_grid_size, n_vars)
+            # [(leading * vars), new_grid] -> [leading, new_grid, vars] -> [..., new_grid, vars]
+            y = rearrange(y2d, "(lead vars) new_grid -> lead new_grid vars", lead=n_leading, vars=n_vars)
+            return y.reshape(*leading_shape, self.target_grid_size, n_vars)
+
+        y = x.new_empty(*leading_shape, self.target_grid_size, n_vars)
+        for start in range(0, n_vars, variable_chunk_size):
+            end = min(start + variable_chunk_size, n_vars)
+            chunk_vars = end - start
+
+            # Chunk over final variable axis to reduce sparse-mm peak memory.
+            x_chunk = x[..., :, start:end]
+            x2d_chunk = rearrange(x_chunk, "... grid vars -> (... vars) grid").contiguous()
+            y2d_chunk = self._apply_matrix(x2d_chunk)
+
+            y_chunk = rearrange(
+                y2d_chunk,
+                "(lead vars) new_grid -> lead new_grid vars",
+                lead=n_leading,
+                vars=chunk_vars,
+            )
+            y[..., :, start:end] = y_chunk.reshape(*leading_shape, self.target_grid_size, chunk_vars)
+
+        return y
