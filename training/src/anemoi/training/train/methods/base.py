@@ -583,6 +583,39 @@ class BaseTrainingModule(pl.LightningModule, ABC):
         self.reader_shard_sizes = {name: list(sizes) for name, sizes in reader_shard_sizes.items()}
         self.reader_grid_sizes = {name: int(sum(sizes)) for name, sizes in self.reader_shard_sizes.items()}
 
+    def _infer_runtime_grid_shard_sizes(
+        self,
+        batch: torch.Tensor,
+        *,
+        comm_group: ProcessGroup | None,
+        comm_group_size: int,
+    ) -> list[int] | None:
+        """Infer rank-local grid shard sizes from the live tensor via all-gather."""
+        if comm_group is None or comm_group_size <= 1:
+            return None
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return None
+
+        local_size = torch.tensor(
+            [int(batch.shape[self.grid_dim])],
+            dtype=torch.int64,
+            device=batch.device if batch.is_cuda else torch.device("cpu"),
+        )
+        gathered_sizes = [torch.zeros_like(local_size) for _ in range(comm_group_size)]
+        torch.distributed.all_gather(gathered_sizes, local_size, group=comm_group)
+        return [int(size.item()) for size in gathered_sizes]
+
+    def _update_grid_shard_metadata(self, dataset_name: str, layout: str, shard_sizes: list[int]) -> None:
+        """Persist refreshed shard metadata so all downstream consumers stay consistent."""
+        if layout == "reader":
+            self.reader_shard_sizes[dataset_name] = list(shard_sizes)
+            self.reader_grid_sizes[dataset_name] = int(sum(shard_sizes))
+            return
+
+        self.shard_sizes[dataset_name] = list(shard_sizes)
+        self.grid_sizes[dataset_name] = int(sum(shard_sizes))
+
     def _prepare_tensors_for_loss(
         self,
         y_pred: torch.Tensor,
@@ -890,6 +923,20 @@ class BaseTrainingModule(pl.LightningModule, ABC):
             # Run preprocessors (including grid-changing ones like regridding) on full reader-layout grid.
             batch[dataset_name] = self.model.pre_processors[dataset_name](batch[dataset_name])  # normalized in-place
 
+            # Keep model-layout shard metadata in sync with any grid-changing preprocessors.
+            model_grid_size = int(batch[dataset_name].shape[self.grid_dim])
+            if model_grid_size != int(self.grid_sizes.get(dataset_name, model_grid_size)):
+                shard_sizes = get_balanced_partition_sizes(model_grid_size, self.model_comm_group_size)
+                LOGGER.info(
+                    "Updating model-layout shard metadata for dataset=%s after preprocessing: "
+                    "grid_size %d -> %d, shard_sizes=%s",
+                    dataset_name,
+                    int(self.grid_sizes.get(dataset_name, model_grid_size)),
+                    model_grid_size,
+                    shard_sizes,
+                )
+                self._update_grid_shard_metadata(dataset_name, layout="model", shard_sizes=shard_sizes)
+
             # Stage 2: shard to model-layout (graph-sized) after preprocessing.
             if self.keep_batch_sharded and self.model_comm_group_size > 1:
                 if self.model_comm_group is None:
@@ -974,26 +1021,63 @@ class BaseTrainingModule(pl.LightningModule, ABC):
             comm_group_size = self.model_comm_group_size
             comm_group = self.model_comm_group
 
+        grid_size_int = int(grid_size) if grid_size is not None else int(batch.shape[self.grid_dim])
+
         if (
             grid_shard_sizes is None
             or comm_group is None
             or comm_group_size == 1
-            or grid_size == batch.shape[self.grid_dim]
+            or grid_size_int == int(batch.shape[self.grid_dim])
         ):
             return batch
 
         current_grid = int(batch.shape[self.grid_dim])
-        if current_grid not in set(grid_shard_sizes):
-            LOGGER.warning(
-                "Skipping allgather for dataset=%s layout=%s due to grid-size mismatch "
-                "(tensor=%d, shard_sizes=%s, full=%d).",
-                dataset_name,
-                layout,
-                current_grid,
-                grid_shard_sizes,
-                int(grid_size),
+        rank = self.reader_group_rank if layout == "reader" else self.model_comm_group_rank
+        expected_local = int(grid_shard_sizes[rank]) if rank < len(grid_shard_sizes) else None
+
+        if expected_local != current_grid:
+            runtime_grid_shard_sizes = self._infer_runtime_grid_shard_sizes(
+                batch,
+                comm_group=comm_group,
+                comm_group_size=comm_group_size,
             )
-            return batch
+
+            if runtime_grid_shard_sizes is None:
+                LOGGER.warning(
+                    "Skipping allgather for dataset=%s layout=%s due to grid-size mismatch "
+                    "(tensor=%d, shard_sizes=%s, full=%d).",
+                    dataset_name,
+                    layout,
+                    current_grid,
+                    grid_shard_sizes,
+                    grid_size_int,
+                )
+                return batch
+
+            runtime_expected_local = (
+                int(runtime_grid_shard_sizes[rank]) if rank < len(runtime_grid_shard_sizes) else None
+            )
+            if runtime_expected_local != current_grid:
+                LOGGER.warning(
+                    "Skipping allgather for dataset=%s layout=%s due to unresolved grid-size mismatch "
+                    "(tensor=%d, stale_shard_sizes=%s, runtime_shard_sizes=%s).",
+                    dataset_name,
+                    layout,
+                    current_grid,
+                    grid_shard_sizes,
+                    runtime_grid_shard_sizes,
+                )
+                return batch
+
+            LOGGER.warning(
+                "Detected stale %s shard metadata for dataset=%s; updating shard_sizes %s -> %s.",
+                layout,
+                dataset_name,
+                grid_shard_sizes,
+                runtime_grid_shard_sizes,
+            )
+            self._update_grid_shard_metadata(dataset_name, layout=layout, shard_sizes=runtime_grid_shard_sizes)
+            grid_shard_sizes = runtime_grid_shard_sizes
 
         return gather_tensor(
             batch,
