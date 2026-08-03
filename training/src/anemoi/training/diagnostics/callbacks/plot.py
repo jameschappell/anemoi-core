@@ -383,7 +383,7 @@ class BasePerBatchPlotCallback(BasePlotCallback):
                 raise TypeError(preds)
             gathered_predictions = [
                 {
-                    dataset_name: pl_module.allgather_batch(dataset_pred, dataset_name)
+                    dataset_name: pl_module.allgather_batch(dataset_pred, dataset_name, layout="model")
                     for dataset_name, dataset_pred in pred.items()
                 }
                 for pred in preds
@@ -1077,7 +1077,7 @@ class PlotSample(BasePlotAdditionalMetrics):
             return {}
 
         auxiliary_output = {
-            dataset_name: pl_module.allgather_batch(dataset_tensor, dataset_name)
+            dataset_name: pl_module.allgather_batch(dataset_tensor, dataset_name, layout="model")
             for dataset_name, dataset_tensor in auxiliary_output.items()
         }
         return {"auxiliary_output": auxiliary_output}
