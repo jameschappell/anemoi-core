@@ -178,6 +178,13 @@ class LossVariableMapper(BaseLossWrapper):
     def set_data_indices(self, data_indices: IndexCollection) -> BaseLoss:
         """Hook to set the data indices for the loss."""
         self.data_indices = data_indices
+
+        # Keep wrapped losses that depend on index metadata in sync with the
+        # mapper's current view.
+        set_inner_data_indices = getattr(self.loss, "set_data_indices", None)
+        if callable(set_inner_data_indices):
+            set_inner_data_indices(data_indices)
+
         model_output_name_to_position = data_indices.model.output.name_to_position
         data_full_name_to_position = data_indices.data_full_name_to_position
         data_output_name_to_pos = data_indices.data.output.name_to_position
