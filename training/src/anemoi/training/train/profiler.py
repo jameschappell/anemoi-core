@@ -156,8 +156,10 @@ class AnemoiProfiler(AnemoiTrainer):
     @cached_property
     def model_summary(self) -> str | None:
         if self.config.diagnostics.benchmark_profiler.model_summary.enabled:
-            example_input_array = self.get_example_input_array()
             model = self.model
+            if self.config.model.keep_batch_sharded:
+                return self.profiler.get_model_summary(model=model)
+            example_input_array = self.get_example_input_array()
             return self.profiler.get_model_summary(model=model, example_input_array=example_input_array)
         return None
 
@@ -306,6 +308,11 @@ class AnemoiProfiler(AnemoiTrainer):
         if type(batch) in [list, tuple]:
             batch = batch[0]
 
+        device = torch.device("cuda")
+        self.model.to(device)
+        batch = self.model.transfer_batch_to_device(batch, device)
+        batch = self.model.on_after_batch_transfer(batch, 0)
+
         example_input_array = {}
         for dataset_name in batch:
             example_input_array[dataset_name] = batch[dataset_name][
@@ -314,15 +321,6 @@ class AnemoiProfiler(AnemoiTrainer):
                 ...,
                 self.data_indices[dataset_name].data.input.full,
             ]
-            # If the input batch is sharded, replicate it to its full size
-            if self.config.dataloader.read_group_size > 1:
-                example_input_array[dataset_name] = example_input_array[dataset_name].repeat(
-                    1,
-                    1,
-                    1,
-                    self.config.dataloader.read_group_size,
-                    1,
-                )
         return example_input_array
 
     @cached_property
