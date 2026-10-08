@@ -116,8 +116,8 @@ PROFILER_ACTIONS = [
     r"\[LightningModule]\w+\.configure_sharded_model",
     r"\[LightningModule]\w+\.setup",
     r"\[LightningModule]\w+\.prepare_data",
-    r"\[Callback\](.*Plot*)",
-    r"\[Callback\](.*Checkpoint*)",
+    r"\[Callback\](?:.*Plot*)",
+    r"\[Callback\](?:.*Checkpoint*)",
 ]
 
 GPU_METRICS_DICT = {
@@ -212,42 +212,68 @@ class MLFlowSystemSummarizer:
     @property
     def system_metrics(self) -> list[str]:
         run = self.mlflow_client.get_run(self.run_id)
-        return [metric for metric in run.data.metrics if "system" in metric]
+        run_metrics = run.data.metrics
+
+        # `run.data.metrics` is usually a dict of metric_name -> latest_value,
+        # but we handle object-like entries defensively for compatibility.
+        if isinstance(run_metrics, dict):
+            metric_names = run_metrics.keys()
+        else:
+            metric_names = [getattr(metric, "key", str(metric)) for metric in run_metrics]
+
+        return [metric_name for metric_name in metric_names if "system" in metric_name]
 
     def _clean_metric_name(self, metric_name: str) -> str:
         return (
             metric_name.replace("system.", "avg ")
+            .replace("system/", "avg ")
             .replace("_", " ")
             .replace("megabytes", "MB")
             .replace("percentage", "%")
         )
 
     def _get_mean(self, pattern: str, df: pd.DataFrame) -> float:
-        # Filter rows containing the pattern in the 'metric' column
-        filtered_rows = df[df["metric"].str.contains(pattern)]
-        return filtered_rows.loc[:, "value"].astype(np.float32).mean()
+        # Gracefully handle missing/empty metric tables.
+        if df.empty or "metric" not in df.columns or "value" not in df.columns:
+            return float("nan")
+
+        filtered_rows = df[df["metric"].astype(str).str.contains(pattern, regex=True, na=False)]
+        if filtered_rows.empty:
+            return float("nan")
+
+        return pd.to_numeric(filtered_rows.loc[:, "value"], errors="coerce").astype(np.float32).mean()
 
     def _extract_gpu_metrics(self, df: pd.DataFrame) -> pd.DataFrame:
-        # Define the pattern you want to search for
-        pattern = r"gpu\s\d+\s+utilization"
-        df.loc[len(df.index)] = ["avg GPU utilization (%)", self._get_mean(pattern, df)]
+        gpu_patterns = [
+            (r"gpu\s\d+\s+utilization", "avg GPU utilization (%)"),
+            (r"gpu\s\d+\s+memory\s+usage\s+%", "avg GPU memory usage %"),
+            (r"gpu\s\d+\s+memory\s+usage\s+MB", "avg GPU memory usage MB"),
+        ]
 
-        pattern = r"gpu\s\d+\s+memory\s+usage\s+%"
-        df.loc[len(df.index)] = ["avg GPU memory usage %", self._get_mean(pattern, df)]
-
-        pattern = r"gpu\s\d+\s+memory\s+usage\s+MB"
-        df.loc[len(df.index)] = ["avg GPU memory usage MB", self._get_mean(pattern, df)]
+        for pattern, metric_name in gpu_patterns:
+            metric_mean = self._get_mean(pattern, df)
+            if not np.isnan(metric_mean):
+                df.loc[len(df.index)] = [metric_name, metric_mean]
 
         return df
 
     def summarize_mlflow_system_metrics(self) -> pd.DataFrame:
         rows = []
         for metric in self.system_metrics:
-            metric = self.mlflow_client.get_metric_history(self.run_id, metric)
-            avg_value = sum(m.value for m in metric) / len(metric)
-            metric_name = self._clean_metric_name(metric[0].key)
+            metric_history = self.mlflow_client.get_metric_history(self.run_id, metric)
+            if not metric_history:
+                continue
+
+            avg_value = sum(m.value for m in metric_history) / len(metric_history)
+            metric_name = self._clean_metric_name(metric_history[0].key)
             rows.append({"metric": metric_name, "value": f"{avg_value:.2f}"})
-        return self._extract_gpu_metrics(pd.DataFrame(rows))
+
+        system_metrics_df = pd.DataFrame(rows, columns=["metric", "value"])
+        if system_metrics_df.empty:
+            LOGGER.warning("No MLflow system metrics were found for run_id=%s", self.run_id)
+            return system_metrics_df
+
+        return self._extract_gpu_metrics(system_metrics_df)
 
 
 class DummyProfiler(Profiler):
@@ -499,7 +525,7 @@ class BenchmarkProfiler(Profiler):
             f.write(model_summary)
             f.close()
 
-    def get_model_summary(self, model: BaseTrainingModule, example_input_array: dict[str, np.ndarray]) -> str:
+    def get_model_summary(self, model: BaseTrainingModule, example_input_array: dict[str, torch.Tensor]) -> str:
 
         from torchinfo import summary
 
@@ -514,7 +540,7 @@ class BenchmarkProfiler(Profiler):
         summary_str = str(
             summary(
                 model,
-                input_data=example_input_array,
+                input_data=(example_input_array,),
                 depth=20,
                 col_width=16,
                 col_names=["trainable", "input_size", "output_size", "num_params", "params_percent", "mult_adds"],
@@ -522,7 +548,10 @@ class BenchmarkProfiler(Profiler):
                 verbose=0,
             ),
         )
-        self.model_summary_fname = self.dirpath / "model_summary.txt"
+
+        rank = dist.get_rank() if dist.is_initialized() else 0
+        filename = "model_summary.txt" if rank == 0 else f"model_summary_rank{rank}.txt"
+        self.model_summary_fname = self.dirpath / filename
         self._save_model_summary(summary_str, self.model_summary_fname)
         return summary_str
 

@@ -154,9 +154,9 @@ class AnemoiProfiler(AnemoiTrainer):
         return None
 
     @cached_property
-    def model_summary(self) -> str:
-        example_input_array = self.get_example_input_array()
+    def model_summary(self) -> str | None:
         if self.config.diagnostics.benchmark_profiler.model_summary.enabled:
+            example_input_array = self.get_example_input_array()
             model = self.model
             return self.profiler.get_model_summary(model=model, example_input_array=example_input_array)
         return None
@@ -178,12 +178,15 @@ class AnemoiProfiler(AnemoiTrainer):
     def report(self) -> str:
         """Print report to console."""
         LOGGER.info("Generating Profiler reports")
+        model_summary = self.model_summary
+        if model_summary is not None and torch.distributed.is_initialized() and torch.distributed.get_rank() != 0:
+            LOGGER.info("Model Summary (rank %s):\n%s", torch.distributed.get_rank(), model_summary)
         self.print_benchmark_profiler_report(
             memory_metrics_df=self.memory_profile,
             time_metrics_df=self.time_profile,
             speed_metrics_df=self.speed_profile,  # speed profile needs to be generated after time and memory reports
             system_metrics_df=self.system_profile,
-            model_summary=self.model_summary,
+            model_summary=model_summary,
         )
 
     def _get_extra_files(self) -> None:

@@ -7,10 +7,17 @@
 # granted to it by virtue of its status as an intergovernmental organisation
 # nor does it submit to any jurisdiction.
 
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
 import torch
+import torchinfo
 from omegaconf import DictConfig
 
 from anemoi.models.data_indices.collection import IndexCollection
+from anemoi.training.diagnostics.profilers import BenchmarkProfiler
 from anemoi.training.tasks import TemporalDownscaler
 from anemoi.training.train.profiler import AnemoiProfiler
 
@@ -40,3 +47,48 @@ def test_profiler_example_input_uses_task_num_input_timesteps() -> None:
         example_input_array["data"],
         batch["data"][:, : profiler.task.num_input_timesteps, ..., profiler.data_indices["data"].data.input.full],
     )
+
+
+@pytest.mark.parametrize(("rank", "filename"), [(0, "model_summary.txt"), (4, "model_summary_rank4.txt")])
+def test_model_summary_written_per_rank(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    rank: int,
+    filename: str,
+) -> None:
+    profiler = SimpleNamespace(
+        dirpath=tmp_path,
+        _save_model_summary=lambda text, path: BenchmarkProfiler._save_model_summary(None, text, path),
+    )
+    model = MagicMock()
+    model.to.return_value = model
+    tensor = MagicMock()
+    tensor.to.return_value = tensor
+    example_input = {"data": tensor}
+
+    def fake_summary(model_arg: MagicMock, *, input_data: tuple[dict[str, MagicMock]], **_kwargs: object) -> str:
+        assert model_arg is model
+        assert input_data == (example_input,)
+        return f"Summary for rank {rank}"
+
+    monkeypatch.setattr(torchinfo, "summary", fake_summary)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: rank)
+
+    result = BenchmarkProfiler.get_model_summary(profiler, model, example_input)
+
+    assert result == f"Summary for rank {rank}"
+    assert profiler.model_summary_fname == tmp_path / filename
+    assert profiler.model_summary_fname.read_text() == result
+
+
+def test_nonzero_rank_logs_model_summary(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+    profiler = MagicMock(spec=AnemoiProfiler)
+    profiler.model_summary = "Model summary for rank 4"
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 4)
+
+    with caplog.at_level("INFO", logger="anemoi.training.train.profiler"):
+        AnemoiProfiler.report(profiler)
+
+    assert "Model Summary (rank 4):\nModel summary for rank 4" in caplog.text
